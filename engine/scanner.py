@@ -1,9 +1,20 @@
 import logging
+import json as _json
 import httpx
 
 log = logging.getLogger("scanner")
 
 GAMMA_API = "https://gamma-api.polymarket.com"
+
+
+def _parse_token_ids(m: dict) -> tuple:
+    """Extract YES and NO token IDs from market data."""
+    token_ids = m.get("clobTokenIds") or []
+    if isinstance(token_ids, str):
+        token_ids = _json.loads(token_ids)
+    yes_token = token_ids[0] if len(token_ids) > 0 else None
+    no_token = token_ids[1] if len(token_ids) > 1 else None
+    return yes_token, no_token
 
 
 class PolymarketScanner:
@@ -12,7 +23,7 @@ class PolymarketScanner:
         self.client = httpx.AsyncClient(timeout=15.0)
 
     async def fetch(self) -> list:
-        """Fetch active markets from Polymarket Gamma API."""
+        """Fetch active markets from Polymarket Gamma API with token IDs."""
         try:
             markets = []
             offset = 0
@@ -32,19 +43,21 @@ class PolymarketScanner:
                         continue
                     raw_prices = m.get("outcomePrices") or ["0.5", "0.5"]
                     if isinstance(raw_prices, str):
-                        import json as _json
                         raw_prices = _json.loads(raw_prices)
                     yes_price = float(raw_prices[0])
                     if yes_price > 0.97 or yes_price < 0.03:
                         continue
+                    yes_token, no_token = _parse_token_ids(m)
                     markets.append({
-                        "id":        m["id"],
-                        "question":  m.get("question", ""),
-                        "yes_price": round(yes_price, 4),
-                        "volume":    vol,
+                        "id":         m["id"],
+                        "question":   m.get("question", ""),
+                        "yes_price":  round(yes_price, 4),
+                        "volume":     vol,
                         "volume_24h": float(m.get("volume24hr") or 0),
-                        "liquidity": liq,
-                        "spread":    float(m.get("spread") or 0),
+                        "liquidity":  liq,
+                        "spread":     float(m.get("spread") or 0),
+                        "yes_token":  yes_token,
+                        "no_token":   no_token,
                     })
                 offset += 100
                 if len(batch) < 100:
@@ -53,40 +66,6 @@ class PolymarketScanner:
             return markets
         except Exception as e:
             log.error(f"[SCANNER] {e}")
-            return []
-
-    async def quick_fetch(self, known_ids: set) -> list:
-        """Quick fetch top 200 markets by 24h volume. Update prices for known grouped markets."""
-        try:
-            markets = []
-            r = await self.client.get(f"{GAMMA_API}/markets", params={
-                "active": "true", "closed": "false",
-                "order": "volume24hr", "ascending": "false",
-                "limit": 100, "offset": 0,
-            })
-            batch = r.json() or []
-            for m in batch:
-                raw_prices = m.get("outcomePrices") or ["0.5", "0.5"]
-                if isinstance(raw_prices, str):
-                    import json as _json
-                    raw_prices = _json.loads(raw_prices)
-                yes_price = float(raw_prices[0])
-                if yes_price > 0.97 or yes_price < 0.03:
-                    continue
-                mid = m["id"]
-                if mid in known_ids:
-                    markets.append({
-                        "id":        mid,
-                        "question":  m.get("question", ""),
-                        "yes_price": round(yes_price, 4),
-                        "volume":    float(m.get("volume") or 0),
-                        "volume_24h": float(m.get("volume24hr") or 0),
-                        "liquidity": float(m.get("liquidity") or 0),
-                        "spread":    float(m.get("spread") or 0),
-                    })
-            return markets
-        except Exception as e:
-            log.error(f"[SCANNER] quick_fetch: {e}")
             return []
 
     async def close(self):

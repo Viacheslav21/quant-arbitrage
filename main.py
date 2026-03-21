@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 from engine.scanner import PolymarketScanner
 from engine.groups import assign
 from engine.detector import Detector
+from engine.ws_client import PolymarketWS
 from utils.db import Database
 from utils.telegram import TelegramBot
 
@@ -158,6 +159,23 @@ async def main():
     scanner = PolymarketScanner(CONFIG)
     detector = Detector()
     telegram = TelegramBot(CONFIG["TELEGRAM_TOKEN"], CONFIG["TELEGRAM_CHAT_ID"])
+    ws = PolymarketWS()
+
+    # Shared state between WS callbacks and main loop
+    _pending_signals = []
+
+    async def on_price_change(market_id, old_price, new_price):
+        """Called by WebSocket on every price update — feed detector in real time."""
+        if market_id in market_map:
+            market_map[market_id]["yes_price"] = new_price
+
+    async def on_trade(market_id, price, size, side):
+        """Called on every trade — log whale trades."""
+        if size >= 500:
+            q = market_map.get(market_id, {}).get("question", "?")[:50]
+            log.info(f"[WHALE] 🐋 ${size:.0f} {side} on '{q}' @ {price:.4f}")
+
+    ws.set_callbacks(on_price_change=on_price_change, on_trade=on_trade)
 
     loop = asyncio.get_event_loop()
     for sig_name in ("SIGTERM", "SIGINT"):
@@ -165,45 +183,68 @@ async def main():
             import signal as _signal
             loop.add_signal_handler(
                 getattr(_signal, sig_name),
-                lambda: asyncio.create_task(_shutdown(db, telegram, scanner)),
+                lambda: asyncio.create_task(_shutdown(db, telegram, scanner, ws)),
             )
         except (NotImplementedError, AttributeError):
             pass
 
-    markets = []
+    # Initial full scan to discover markets and token IDs
+    markets = await scanner.fetch()
+    market_map = {m["id"]: m for m in markets}
+    groups = assign(markets)
     grouped_ids = set()
-    market_map = {}  # id -> market dict
+    grouped_markets = []
+    for gm in groups.values():
+        for m in gm:
+            grouped_ids.add(m["id"])
+            grouped_markets.append(market_map.get(m["id"], m))
+
+    log.info(f"[INIT] {len(markets)} markets, {len(grouped_ids)} in {len(groups)} groups")
+
+    # Register grouped markets for WebSocket
+    ws.register_markets(grouped_markets)
+
+    # Start WebSocket in background
+    ws_task = asyncio.create_task(ws.connect())
+
     tick = 0
+    RESCAN_EVERY = 150  # full rescan every ~10 min (150 × 4s)
 
     while True:
         try:
             tick += 1
             now = time.time()
 
-            # Full market fetch every N ticks (save API calls)
-            if tick % CONFIG["FULL_SCAN_EVERY"] == 1 or not markets:
-                markets = await scanner.fetch()
-                if not markets:
-                    await asyncio.sleep(CONFIG["SCAN_INTERVAL"])
-                    continue
-                market_map = {m["id"]: m for m in markets}
-                # Build set of grouped market IDs for quick_fetch
-                groups_tmp = assign(markets)
-                grouped_ids = set()
-                for gm in groups_tmp.values():
-                    for m in gm:
-                        grouped_ids.add(m["id"])
-                log.info(f"[SCAN] Full: {len(markets)} markets, {len(grouped_ids)} in groups, {len(groups_tmp)} groups")
-            else:
-                # Quick fetch: 1 API call, update only grouped markets
-                updated = await scanner.quick_fetch(grouped_ids)
-                for m in updated:
-                    market_map[m["id"]] = m
-                # Rebuild markets list with updated prices
-                markets = list(market_map.values())
+            # Periodic full rescan to discover new markets
+            if tick % RESCAN_EVERY == 0:
+                new_markets = await scanner.fetch()
+                if new_markets:
+                    markets = new_markets
+                    market_map = {m["id"]: m for m in markets}
+                    groups = assign(markets)
+                    new_grouped = []
+                    for gm in groups.values():
+                        for m in gm:
+                            if m["id"] not in grouped_ids:
+                                grouped_ids.add(m["id"])
+                                new_grouped.append(market_map.get(m["id"], m))
+                    if new_grouped:
+                        ws.register_markets(new_grouped)
+                        await ws.add_subscriptions(
+                            [m["yes_token"] for m in new_grouped if m.get("yes_token")] +
+                            [m["no_token"] for m in new_grouped if m.get("no_token")]
+                        )
+                    log.info(f"[RESCAN] {len(markets)} markets, {len(grouped_ids)} in {len(groups)} groups")
 
-            # Assign markets to correlation groups
-            groups = assign(markets)
+            # Update market prices from WebSocket data
+            for mid in grouped_ids:
+                ws_price = ws.get_price(mid)
+                if ws_price > 0 and mid in market_map:
+                    market_map[mid]["yes_price"] = ws_price
+
+            # Rebuild markets list with latest prices
+            current_markets = list(market_map.values())
+            groups = assign(current_markets)
 
             # Feed prices and detect signals
             total_signals = []
@@ -213,18 +254,19 @@ async def main():
                 total_signals.extend(signals)
 
             # Execute signals
-            for sig in total_signals[:3]:  # max 3 signals per tick
+            for sig in total_signals[:3]:
                 executed = await execute_signal(sig, db, telegram, CONFIG)
                 if executed:
                     detector.mark_cooldown(sig["market_id"])
 
-            # Monitor open positions
-            await monitor_positions(db, telegram, scanner, CONFIG, markets)
+            # Monitor open positions (use WS prices)
+            await monitor_positions(db, telegram, scanner, CONFIG, current_markets)
 
-            # Stats logging every 30 ticks (~2 min)
-            if tick % 30 == 0:
+            # Stats logging every 60 ticks (~4 min)
+            if tick % 60 == 0:
                 open_pos = await db.get_open_positions(CONFIG["CONFIG_TAG"])
-                log.info(f"[TICK #{tick}] {len(groups)} groups | {len(markets)} markets | {len(open_pos)} open arb positions")
+                ws_active = len([1 for p in ws.prices.values() if time.time() - p.get("last_update", 0) < 30])
+                log.info(f"[TICK #{tick}] {len(groups)} groups | {ws_active} WS live | {len(open_pos)} open positions")
 
         except Exception as e:
             log.error(f"[MAIN] {e}", exc_info=True)
@@ -232,8 +274,10 @@ async def main():
         await asyncio.sleep(CONFIG["SCAN_INTERVAL"])
 
 
-async def _shutdown(db, telegram, scanner):
+async def _shutdown(db, telegram, scanner, ws=None):
     log.info("🛑 Shutting down...")
+    if ws:
+        ws.stop()
     await scanner.close()
     await telegram.close()
     await db.close()
