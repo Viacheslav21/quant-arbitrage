@@ -55,5 +55,39 @@ class PolymarketScanner:
             log.error(f"[SCANNER] {e}")
             return []
 
+    async def quick_fetch(self, known_ids: set) -> list:
+        """Quick fetch top 200 markets by 24h volume. Update prices for known grouped markets."""
+        try:
+            markets = []
+            r = await self.client.get(f"{GAMMA_API}/markets", params={
+                "active": "true", "closed": "false",
+                "order": "volume24hr", "ascending": "false",
+                "limit": 100, "offset": 0,
+            })
+            batch = r.json() or []
+            for m in batch:
+                raw_prices = m.get("outcomePrices") or ["0.5", "0.5"]
+                if isinstance(raw_prices, str):
+                    import json as _json
+                    raw_prices = _json.loads(raw_prices)
+                yes_price = float(raw_prices[0])
+                if yes_price > 0.97 or yes_price < 0.03:
+                    continue
+                mid = m["id"]
+                if mid in known_ids:
+                    markets.append({
+                        "id":        mid,
+                        "question":  m.get("question", ""),
+                        "yes_price": round(yes_price, 4),
+                        "volume":    float(m.get("volume") or 0),
+                        "volume_24h": float(m.get("volume24hr") or 0),
+                        "liquidity": float(m.get("liquidity") or 0),
+                        "spread":    float(m.get("spread") or 0),
+                    })
+            return markets
+        except Exception as e:
+            log.error(f"[SCANNER] quick_fetch: {e}")
+            return []
+
     async def close(self):
         await self.client.aclose()

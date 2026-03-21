@@ -170,6 +170,8 @@ async def main():
             pass
 
     markets = []
+    grouped_ids = set()
+    market_map = {}  # id -> market dict
     tick = 0
 
     while True:
@@ -183,6 +185,21 @@ async def main():
                 if not markets:
                     await asyncio.sleep(CONFIG["SCAN_INTERVAL"])
                     continue
+                market_map = {m["id"]: m for m in markets}
+                # Build set of grouped market IDs for quick_fetch
+                groups_tmp = assign(markets)
+                grouped_ids = set()
+                for gm in groups_tmp.values():
+                    for m in gm:
+                        grouped_ids.add(m["id"])
+                log.info(f"[SCAN] Full: {len(markets)} markets, {len(grouped_ids)} in groups, {len(groups_tmp)} groups")
+            else:
+                # Quick fetch: 1 API call, update only grouped markets
+                updated = await scanner.quick_fetch(grouped_ids)
+                for m in updated:
+                    market_map[m["id"]] = m
+                # Rebuild markets list with updated prices
+                markets = list(market_map.values())
 
             # Assign markets to correlation groups
             groups = assign(markets)
