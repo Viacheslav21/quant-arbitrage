@@ -118,9 +118,10 @@ async def monitor_positions(db: Database, telegram: TelegramBot, scanner: Polyma
         if pnl_pct >= config["TP_PCT"]:
             close_reason = "TAKE_PROFIT"
 
-        # Stop loss
-        elif pnl_pct <= -config["SL_PCT"]:
-            close_reason = "STOP_LOSS"
+        # Breakeven stop: if price returns to entry after initially moving, exit
+        # Allow -1% buffer to avoid noise triggers
+        elif pnl_pct <= -0.01:
+            close_reason = "BREAKEVEN_STOP"
 
         # Timeout — 30 min max hold
         elif pos.get("opened_at"):

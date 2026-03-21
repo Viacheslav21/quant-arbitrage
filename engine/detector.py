@@ -78,8 +78,15 @@ class Detector:
             if m.get("spread", 0) > MIN_SPREAD:
                 continue  # too illiquid
 
-            # Direction: lagger should follow leader
-            if leader["move"] > 0:
+            # Direction: account for inverse correlation
+            # leader direction × lagger direction = expected move direction
+            leader_dir = leader["market"].get("direction", 1)
+            lagger_dir = m.get("direction", 1)
+            # same×same=1 (follow), same×inverse=-1 (opposite), inverse×inverse=1 (follow)
+            correlation = leader_dir * lagger_dir
+            leader_up = leader["move"] > 0
+
+            if (leader_up and correlation > 0) or (not leader_up and correlation < 0):
                 side = "YES"
                 side_price = m["yes_price"]
             else:

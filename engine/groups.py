@@ -18,16 +18,36 @@ CORRELATION_GROUPS = {
     "sp500":    ["s&p 500", "s&p500", "sp500", "stock market crash"],
 }
 
+# Inverse keywords: if question contains these, it moves OPPOSITE to the group
+# e.g., "Bitcoin above $100k" = bullish (same), "Bitcoin dip to $60k" = bearish (inverse)
+INVERSE_KEYWORDS = {
+    "btc":  ["dip", "below", "crash", "drop", "fall"],
+    "eth":  ["dip", "below", "crash", "drop", "fall"],
+    "oil":  ["below", "crash", "drop", "fall"],
+    "gold": ["below", "crash", "drop", "fall"],
+    "sp500": ["drop", "crash", "fall", "below"],
+}
+
+
+def _is_inverse(group_name: str, question: str) -> bool:
+    """Check if market moves inverse to the group direction."""
+    inv_kws = INVERSE_KEYWORDS.get(group_name, [])
+    q = question.lower()
+    return any(kw in q for kw in inv_kws)
+
 
 def assign(markets: list) -> dict:
     """Assign markets to correlation groups by keyword matching.
+    Each market gets a 'direction' field: 1 (same) or -1 (inverse).
     Returns {group_name: [market, ...]} with only groups having 2+ markets."""
     groups = {}
     for m in markets:
         q = m["question"].lower()
         for group_name, keywords in CORRELATION_GROUPS.items():
             if any(kw in q for kw in keywords):
-                groups.setdefault(group_name, []).append(m)
+                m_copy = dict(m)
+                m_copy["direction"] = -1 if _is_inverse(group_name, q) else 1
+                groups.setdefault(group_name, []).append(m_copy)
                 break  # one group per market to avoid double-counting
 
     # Only keep groups with 2+ markets (need at least leader + lagger)
