@@ -102,6 +102,34 @@ class Database:
                     "UPDATE stats SET bankroll=bankroll+$1, total_pnl=total_pnl+$1, total_bets=total_bets+1, losses=losses+1, updated_at=NOW() WHERE id=1",
                     pnl)
 
+    async def cleanup_arb_positions(self, config_tag: str = "arb-v1"):
+        """Remove all arb positions and recalculate stats from quant-engine positions only."""
+        async with self.pool.acquire() as conn:
+            # Delete arb positions
+            r1 = await conn.execute("DELETE FROM positions WHERE config_tag = $1", config_tag)
+            r2 = await conn.execute("DELETE FROM arb_signals WHERE TRUE")
+
+            # Recalculate stats from remaining (non-arb) positions
+            row = await conn.fetchrow("""
+                SELECT
+                    COUNT(*) FILTER (WHERE status='closed') as total_bets,
+                    COUNT(*) FILTER (WHERE result='WIN') as wins,
+                    COUNT(*) FILTER (WHERE result='LOSS') as losses,
+                    COALESCE(SUM(pnl) FILTER (WHERE status='closed'), 0) as total_pnl
+                FROM positions
+            """)
+            starting_bankroll = 1000.0  # default
+            bankroll = starting_bankroll + float(row["total_pnl"])
+            await conn.execute("""
+                UPDATE stats SET bankroll=$1, total_pnl=$2, total_bets=$3, wins=$4, losses=$5, updated_at=NOW()
+                WHERE id=1
+            """, bankroll, float(row["total_pnl"]), row["total_bets"], row["wins"], row["losses"])
+
+            log.info(f"[DB] Cleanup: deleted arb positions ({r1}), signals ({r2}). "
+                     f"Recalculated: bankroll=${bankroll:.2f}, pnl=${row['total_pnl']:.2f}, "
+                     f"W:{row['wins']}/L:{row['losses']}")
+            return bankroll
+
     async def close(self):
         if self.pool:
             await self.pool.close()

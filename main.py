@@ -51,8 +51,9 @@ async def execute_signal(sig: dict, db: Database, telegram: TelegramBot, config:
             return False
 
     stats = await db.get_stats()
-    bankroll = stats.get("bankroll", config["BANKROLL"])
+    bankroll = min(stats.get("bankroll", config["BANKROLL"]), config["BANKROLL"])  # never exceed starting bankroll
     stake = round(bankroll * config["KELLY_FRAC"], 2)
+    stake = min(stake, 50.0)  # hard cap $50 per arb trade
     if stake < 1.0:
         return False
 
@@ -115,8 +116,9 @@ async def monitor_positions(db: Database, telegram: TelegramBot, scanner: Polyma
         pnl_pct = (price - pos["side_price"]) / pos["side_price"]
         close_reason = None
 
-        # Take profit
+        # Take profit — cap at TP to avoid phantom gains from stale prices
         if pnl_pct >= config["TP_PCT"]:
+            pnl_pct = config["TP_PCT"]  # lock at TP, don't overshoot
             close_reason = "TAKE_PROFIT"
 
         # Breakeven stop: if price returns to entry after initially moving, exit
@@ -155,6 +157,9 @@ async def main():
 
     db = Database(CONFIG["DATABASE_URL"])
     await db.init()
+
+    # Clean up any fake PnL from previous runs
+    await db.cleanup_arb_positions(CONFIG["CONFIG_TAG"])
 
     scanner = PolymarketScanner(CONFIG)
     detector = Detector()

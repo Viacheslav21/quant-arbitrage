@@ -12,7 +12,7 @@ MIN_SPREAD = 0.05        # skip markets with spread > 5¢
 MIN_PRICE = 0.10         # skip markets priced < 10¢ (bad risk/reward)
 MAX_PRICE = 0.90         # skip markets priced > 90¢
 COOLDOWN = 300            # 5 min cooldown per market
-GROUP_COOLDOWN = 120      # 2 min cooldown per group after signal
+GROUP_COOLDOWN = 600      # 10 min cooldown per group after signal
 MAX_HISTORY = 60          # ~4 min of ticks at 4s interval
 WARMUP_TICKS = 30         # ~2 min warmup before detecting
 
