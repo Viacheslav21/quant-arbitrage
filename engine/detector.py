@@ -9,18 +9,25 @@ LEADER_MIN_MOVE = 0.03   # 3¢ minimum move to be a "leader"
 LAGGER_MAX_MOVE = 0.01   # 1¢ max move to be considered "lagging"
 LOOKBACK_TICKS = 6       # ~24 seconds at 4s interval
 MIN_SPREAD = 0.05        # skip markets with spread > 5¢
+MIN_PRICE = 0.10         # skip markets priced < 10¢ (bad risk/reward)
+MAX_PRICE = 0.90         # skip markets priced > 90¢
 COOLDOWN = 300            # 5 min cooldown per market
+GROUP_COOLDOWN = 120      # 2 min cooldown per group after signal
 MAX_HISTORY = 60          # ~4 min of ticks at 4s interval
+WARMUP_TICKS = 30         # ~2 min warmup before detecting
 
 
 class Detector:
     def __init__(self):
         self.history: dict[str, deque] = {}  # market_id -> deque of (timestamp, yes_price)
         self._cooldown: dict[str, float] = {}  # market_id -> last signal timestamp
+        self._group_cooldown: dict[str, float] = {}  # group_name -> last signal timestamp
+        self._tick_count: int = 0
 
     def update(self, markets: list):
         """Feed new prices for markets."""
         now = time.time()
+        self._tick_count += 1
         for m in markets:
             mid = m["id"]
             if mid not in self.history:
@@ -31,6 +38,14 @@ class Detector:
         """Detect leader/lagger divergences within a group.
         Returns list of signal dicts."""
         now = time.time()
+
+        # Warmup — need enough ticks to establish baseline
+        if self._tick_count < WARMUP_TICKS:
+            return []
+
+        # Group cooldown — don't spam signals from same group
+        if group_name in self._group_cooldown and now - self._group_cooldown[group_name] < GROUP_COOLDOWN:
+            return []
 
         # Clean expired cooldowns
         self._cooldown = {k: v for k, v in self._cooldown.items() if now - v < COOLDOWN}
@@ -77,6 +92,9 @@ class Detector:
             m = data["market"]
             if m.get("spread", 0) > MIN_SPREAD:
                 continue  # too illiquid
+            # Skip extreme prices — bad risk/reward
+            if m["yes_price"] < MIN_PRICE or m["yes_price"] > MAX_PRICE:
+                continue
 
             # Direction: account for inverse correlation
             # leader direction × lagger direction = expected move direction
@@ -99,6 +117,7 @@ class Detector:
 
             if ev < 0.03:  # skip tiny edge
                 continue
+            ev = min(ev, 0.50)  # cap EV at 50% — anything higher is likely noise
 
             signals.append({
                 "market_id":  mid,
@@ -115,6 +134,8 @@ class Detector:
 
         return signals
 
-    def mark_cooldown(self, market_id: str):
-        """Mark market as recently signaled."""
+    def mark_cooldown(self, market_id: str, group_name: str = None):
+        """Mark market and group as recently signaled."""
         self._cooldown[market_id] = time.time()
+        if group_name:
+            self._group_cooldown[group_name] = time.time()

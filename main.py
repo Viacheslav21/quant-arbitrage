@@ -253,11 +253,11 @@ async def main():
                 signals = detector.detect(group_name, group_markets)
                 total_signals.extend(signals)
 
-            # Execute signals
-            for sig in total_signals[:3]:
+            # Execute max 1 signal per tick — quality over quantity
+            for sig in total_signals[:1]:
                 executed = await execute_signal(sig, db, telegram, CONFIG)
                 if executed:
-                    detector.mark_cooldown(sig["market_id"])
+                    detector.mark_cooldown(sig["market_id"], sig.get("group"))
 
             # Monitor open positions (use WS prices)
             await monitor_positions(db, telegram, scanner, CONFIG, current_markets)
