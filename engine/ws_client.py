@@ -126,8 +126,16 @@ class PolymarketWS:
             except Exception:
                 break
 
-    async def _handle_message(self, data: dict):
+    async def _handle_message(self, data):
         """Process incoming WebSocket messages."""
+        # API sometimes sends arrays (batch of events)
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict):
+                    await self._handle_message(item)
+            return
+        if not isinstance(data, dict):
+            return
         event_type = data.get("event_type")
 
         if event_type == "price_change":
