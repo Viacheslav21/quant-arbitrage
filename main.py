@@ -290,4 +290,8 @@ async def _shutdown(db, telegram, scanner, ws=None):
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Bot paused — uncomment to resume
+    import sys
+    print("🛑 Quant Arbitrage is paused. Uncomment main() to resume.")
+    sys.exit(0)
+    # asyncio.run(main())
