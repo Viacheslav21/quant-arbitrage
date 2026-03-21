@@ -252,6 +252,7 @@ async def main():
             groups = assign(current_markets)
 
             # Feed prices and detect signals
+            detector._tick_count += 1
             total_signals = []
             for group_name, group_markets in groups.items():
                 detector.update(group_markets)

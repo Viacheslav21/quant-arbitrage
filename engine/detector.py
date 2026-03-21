@@ -27,7 +27,6 @@ class Detector:
     def update(self, markets: list):
         """Feed new prices for markets."""
         now = time.time()
-        self._tick_count += 1
         for m in markets:
             mid = m["id"]
             if mid not in self.history:
