@@ -112,8 +112,9 @@ async def monitor_positions(db: Database, scanner: PolymarketScanner,
         pnl_pct = (price - pos["side_price"]) / pos["side_price"]
         close_reason = None
 
-        # Take profit
+        # Take profit — cap at TP to avoid phantom gains from stale prices
         if pnl_pct >= config["TP_PCT"]:
+            pnl_pct = config["TP_PCT"]
             close_reason = "TAKE_PROFIT"
 
         # Stop loss
