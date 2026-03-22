@@ -7,7 +7,7 @@ log = logging.getLogger("detector")
 
 # ── Timing ──
 LOOKBACK_TICKS = 8        # ~32s at 4s interval for move window
-MIN_HISTORY = 20          # minimum ticks before computing stats (~80s)
+MIN_HISTORY = 40          # minimum ticks before computing stats (~160s)
 MAX_HISTORY = 120         # ~8 min rolling window
 WARMUP_TICKS = 30         # ~2 min warmup before detection
 COOLDOWN = 300            # 5 min per-market cooldown
@@ -17,7 +17,7 @@ MAX_GROUP_SIZE = 15       # cap markets per group (top by liquidity)
 # ── Statistical thresholds ──
 LEADER_Z_THRESHOLD = 2.0  # leader must move ≥ 2σ (statistically significant)
 LAGGER_Z_THRESHOLD = 0.5  # lagger must be quiet (z < 0.5σ)
-MIN_CORRELATION = 0.3     # minimum Pearson ρ to consider a pair
+MIN_CORRELATION = 0.5     # minimum Pearson ρ to consider a pair
 MIN_VOLATILITY = 0.001    # skip markets with near-zero vol
 
 # ── Price / spread filters ──

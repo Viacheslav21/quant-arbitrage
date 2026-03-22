@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-Polymarket arbitrage bot that detects leader/lagger price divergences across correlated prediction markets and generates trading signals. Runs as a long-lived async Python process with PostgreSQL persistence and Telegram alerts.
+Polymarket arbitrage bot that detects leader/lagger price divergences across correlated prediction markets via WebSocket streaming. Uses statistical models (z-scores, Pearson correlation, Ornstein-Uhlenbeck mean reversion) for signal generation. Runs as a long-lived async Python process with PostgreSQL persistence.
 
 ## Running
 
@@ -19,29 +19,52 @@ Deployed via Procfile (`web: python main.py`). No test suite or linter is config
 
 Set in `.env` (loaded via python-dotenv):
 - `DATABASE_URL` — PostgreSQL connection string (shared with a broader quant-engine system)
-- `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` — for alert delivery
 - `SIMULATION` — "true"/"false", controls live vs simulated execution
 - `BANKROLL` — starting capital (default 1000)
 - Tuning: `ARB_SCAN_INTERVAL`, `ARB_FULL_SCAN_EVERY`, `ARB_TP_PCT`, `ARB_SL_PCT`, `ARB_TIMEOUT_MIN`, `MIN_VOLUME`, `ARB_MAX_OPEN`, `ARB_KELLY_FRAC`, `ARB_CONFIG_TAG`
 
+Note: `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are still loaded in CONFIG but Telegram integration is currently disabled (no alerts sent).
+
 ## Architecture
 
-**main.py** — Event loop: scan → group → detect → execute → monitor positions. Runs on a configurable tick interval (default 4s). Full market fetch happens every N ticks to reduce API load; intermediate ticks reuse cached markets.
+**main.py** — Event loop: scan → group → detect → execute → monitor positions. Runs on a configurable tick interval (default 4s). Full market rescan every 150 ticks (~10 min) to discover new markets. Max 1 signal executed per tick. WebSocket provides real-time prices between rescans.
 
-**engine/scanner.py** — `PolymarketScanner` fetches active markets from the Gamma API (`gamma-api.polymarket.com`), filtering by volume and liquidity. Paginates up to 500 markets.
+**engine/scanner.py** — `PolymarketScanner` fetches active markets from the Gamma API (`gamma-api.polymarket.com`), filtering by volume (≥50k) and liquidity (≥5k). Paginates up to 500 markets. Extracts YES/NO token IDs for WebSocket subscription.
 
-**engine/groups.py** — `assign()` bins markets into correlation groups (oil, btc, eth, trump, fed, etc.) via keyword matching on the market question. A market belongs to at most one group; groups with <2 markets are discarded.
+**engine/groups.py** — `assign()` bins markets into correlation groups (oil, btc, eth, trump, iran, ukraine, israel, fed, gold, sp500) via keyword matching on the market question. Supports inverse keywords (e.g. "dip", "below" → direction=-1). A market belongs to at most one group; groups with <2 markets are discarded.
 
-**engine/detector.py** — `Detector` maintains a per-market price history (deque). On each tick, it computes recent price moves over a lookback window and identifies a "leader" (largest mover above threshold) and "laggers" (correlated markets that haven't moved yet). Signals are generated for laggers expected to follow the leader, with EV calculated as a fraction of the leader's move. Per-market cooldown prevents repeated signals.
+**engine/detector.py** — `Detector` — statistical signal engine. Core models:
+- **MarketStats**: per-market rolling statistics (prices, returns, volatility, z-scores) over 120-tick window (~8 min). Minimum 40 ticks (~160s) before stats are considered ready
+- **Z-score detection**: leader needs |z| ≥ 2.0 (statistically significant move), lagger must have |z| < 0.5
+- **Pearson correlation**: rolling ρ between market return series, minimum ρ ≥ 0.5 to consider a pair
+- **Ornstein-Uhlenbeck half-life**: OLS regression on pair spread (ΔS = α + β·S) estimates mean-reversion speed. Skips pairs where half-life exceeds timeout
+- **EV formula**: `expected_move = |leader_move| × |ρ| × (1 − e^(−ln2 × hold/HL)) − spread/2`, then `ev = expected_move / entry_price`
+- **Composite confidence**: 40% correlation + 30% z-significance + 20% liquidity + 10% OU decay. Floor: 0.30
+- **Group size cap**: max 15 markets per group, sorted by liquidity
+- EV range: 2%–15%. Signals ranked by `confidence × EV`
 
-**utils/db.py** — `Database` wraps asyncpg pool. Connects to a shared PostgreSQL instance with pre-existing `positions` and `stats` tables. Creates its own `arb_signals` table on init. Position lifecycle: open → monitor (update price/uPnL) → close (TP/SL/timeout).
+**engine/ws_client.py** — `PolymarketWS` connects to `wss://ws-subscriptions-clob.polymarket.com/ws/market`. Handles price_change, last_trade_price, and book events. Correctly disambiguates YES/NO tokens and converts all prices to YES-denominated. Tracks spread, bid/ask. Callbacks for price changes and whale trades (≥$500). Auto-reconnects on disconnect.
 
-**utils/telegram.py** — `TelegramBot` sends HTML-formatted alerts via the Telegram Bot API.
+**utils/db.py** — `Database` wraps asyncpg pool. **Writes only to own tables** (`arb_signals`, `arb_positions`, `arb_stats`). Reads shared quant-engine tables (`positions`, `stats`) via `get_shared_*()` methods (read-only). Position lifecycle: open → monitor (update price/uPnL) → close (TP/SL/timeout). Bankroll tracked independently in `arb_stats`.
+
+**utils/telegram.py** — `TelegramBot` exists but is not currently wired into the main loop.
+
+## Database Tables (owned by this bot)
+
+| Table | Purpose |
+|---|---|
+| `arb_signals` | Generated arbitrage signals: market_id, side, ev, group_name, leader info |
+| `arb_positions` | Arb trades: side, stake, ev, kelly, tp/sl, status, result, pnl, close_reason |
+| `arb_stats` | Singleton (id=1): bankroll, total_pnl, wins, losses |
+
+Shared tables read (not written): `positions`, `stats` from quant-engine.
 
 ## Key Design Decisions
 
-- The `positions` and `stats` tables are shared with other bots in the quant-engine system; `arb_signals` is owned by this bot
-- Position sizing uses a fixed Kelly fraction of bankroll (default 5%)
+- **Full isolation from quant-engine**: writes only to `arb_*` tables, never touches shared `positions`/`stats`
+- Position sizing: fixed Kelly fraction (default 5%) of arb bankroll, hard cap $50/trade
 - Positions auto-close on take-profit (8%), stop-loss (5%), or timeout (30 min)
-- Max 3 signals executed per tick, max 10 open positions total
+- Max 1 signal per tick, max 10 open positions total
 - Each market can only have one open position at a time
+- Per-market cooldown 5 min, per-group cooldown 10 min after signal
+- Warmup period: 30 ticks (~2 min) before detection begins
