@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 from engine.scanner import PolymarketScanner
 from engine.groups import assign
 from engine.detector import Detector
+from engine.mispricing import MispricingDetector
 from engine.ws_client import PolymarketWS
 from utils.db import Database
 
@@ -81,12 +82,20 @@ async def execute_signal(sig: dict, db: Database, config: dict):
     await db.save_arb_signal(sig)
     await db.save_position(pos)
 
-    log.info(
-        f"[EXEC] {mode} {sig['side']} '{sig['question'][:50]}' | ${stake} "
-        f"EV:{sig['ev']*100:.1f}% ρ:{sig.get('correlation',0):.2f} "
-        f"conf:{sig.get('confidence',0):.2f} HL:{sig.get('half_life_m','?')}m "
-        f"group:{sig['group']}"
-    )
+    sig_type = sig.get("signal_type", "leader_lagger")
+    if sig_type == "mispricing":
+        log.info(
+            f"[EXEC] {mode} {sig['side']} '{sig['question'][:50]}' | ${stake} "
+            f"EV:{sig['ev']*100:.1f}% conf:{sig.get('confidence',0):.2f} "
+            f"type:MISPRICING | {sig.get('leader_q','')}"
+        )
+    else:
+        log.info(
+            f"[EXEC] {mode} {sig['side']} '{sig['question'][:50]}' | ${stake} "
+            f"EV:{sig['ev']*100:.1f}% ρ:{sig.get('correlation',0):.2f} "
+            f"conf:{sig.get('confidence',0):.2f} HL:{sig.get('half_life_m','?')}m "
+            f"group:{sig['group']}"
+        )
     return True
 
 
@@ -149,6 +158,7 @@ async def main():
 
     scanner = PolymarketScanner(CONFIG)
     detector = Detector()
+    mispricing = MispricingDetector()
     ws = PolymarketWS()
 
     # Shared state between WS callbacks and main loop
@@ -244,11 +254,24 @@ async def main():
                 signals = detector.detect(group_name, group_markets)
                 total_signals.extend(signals)
 
+            # Mispricing detection (runs on all markets, not just grouped)
+            mp_signals = mispricing.detect(current_markets)
+            total_signals.extend(mp_signals)
+
+            # Sort: mispricing first (structural edge), then by confidence × EV
+            total_signals.sort(
+                key=lambda s: (s.get("signal_type") == "mispricing", s.get("confidence", 0) * s["ev"]),
+                reverse=True,
+            )
+
             # Execute max 1 signal per tick — quality over quantity
             for sig in total_signals[:1]:
                 executed = await execute_signal(sig, db, CONFIG)
                 if executed:
-                    detector.mark_cooldown(sig["market_id"], sig.get("group"))
+                    if sig.get("signal_type") == "mispricing":
+                        mispricing.mark_cooldown(sig["market_id"])
+                    else:
+                        detector.mark_cooldown(sig["market_id"], sig.get("group"))
 
             # Monitor open positions (use WS prices)
             await monitor_positions(db, scanner, CONFIG, current_markets)

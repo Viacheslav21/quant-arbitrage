@@ -7,8 +7,8 @@ log = logging.getLogger("detector")
 
 # ── Timing ──
 LOOKBACK_TICKS = 8        # ~32s at 4s interval for move window
-MIN_HISTORY = 40          # minimum ticks before computing stats (~160s)
-MAX_HISTORY = 120         # ~8 min rolling window
+MIN_HISTORY = 100         # minimum ticks before computing stats (~7 min)
+MAX_HISTORY = 500         # ~33 min rolling window
 WARMUP_TICKS = 30         # ~2 min warmup before detection
 COOLDOWN = 300            # 5 min per-market cooldown
 GROUP_COOLDOWN = 600      # 10 min per-group cooldown
@@ -26,7 +26,7 @@ MAX_PRICE = 0.90
 MAX_SPREAD = 0.05         # 5¢
 
 # ── EV / confidence gates ──
-MIN_EV = 0.02             # 2% minimum edge after costs
+MIN_EV = 0.05             # 5% minimum edge after costs
 MAX_EV = 0.15             # 15% cap — beyond this is model error
 MIN_CONFIDENCE = 0.30     # composite confidence floor
 
@@ -172,9 +172,10 @@ class Detector:
             decay = 1 - math.exp(-math.log(2) * hold_ticks / hl_ticks)
             expected_move = abs(leader["move"]) * abs(eff_corr) * decay
 
-            # Subtract half-spread (execution cost)
+            # Subtract execution costs: half-spread + estimated slippage (0.5¢)
             spread_cost = m.get("spread", 0) / 2
-            net_move = expected_move - spread_cost
+            slippage = 0.005
+            net_move = expected_move - spread_cost - slippage
             if net_move <= 0:
                 continue
 
@@ -270,7 +271,7 @@ class Detector:
             return float("inf")
 
         n = min(len(sa.prices), len(sb.prices))
-        if n < 15:
+        if n < 50:
             return float("inf")
 
         pa = [sa.prices[len(sa.prices) - n + i][1] for i in range(n)]

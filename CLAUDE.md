@@ -33,15 +33,24 @@ Note: `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are still loaded in CONFIG but
 
 **engine/groups.py** — `assign()` bins markets into correlation groups (oil, btc, eth, trump, iran, ukraine, israel, fed, gold, sp500) via keyword matching on the market question. Supports inverse keywords (e.g. "dip", "below" → direction=-1). A market belongs to at most one group; groups with <2 markets are discarded.
 
-**engine/detector.py** — `Detector` — statistical signal engine. Core models:
-- **MarketStats**: per-market rolling statistics (prices, returns, volatility, z-scores) over 120-tick window (~8 min). Minimum 40 ticks (~160s) before stats are considered ready
+**engine/detector.py** — `Detector` — leader/lagger statistical signal engine. Core models:
+- **MarketStats**: per-market rolling statistics (prices, returns, volatility, z-scores) over 500-tick window (~33 min). Minimum 100 ticks (~7 min) before stats are ready
 - **Z-score detection**: leader needs |z| ≥ 2.0 (statistically significant move), lagger must have |z| < 0.5
 - **Pearson correlation**: rolling ρ between market return series, minimum ρ ≥ 0.35 to consider a pair
-- **Ornstein-Uhlenbeck half-life**: OLS regression on pair spread (ΔS = α + β·S) estimates mean-reversion speed. Skips pairs where half-life exceeds timeout
-- **EV formula**: `expected_move = |leader_move| × |ρ| × (1 − e^(−ln2 × hold/HL)) − spread/2`, then `ev = expected_move / entry_price`
+- **Ornstein-Uhlenbeck half-life**: OLS regression on pair spread (ΔS = α + β·S), minimum 50 data points. Skips pairs where half-life exceeds timeout
+- **EV formula**: `expected_move = |leader_move| × |ρ| × (1 − e^(−ln2 × hold/HL)) − spread/2 − slippage(0.5¢)`, then `ev = expected_move / entry_price`
 - **Composite confidence**: 40% correlation + 30% z-significance + 20% liquidity + 10% OU decay. Floor: 0.30
 - **Group size cap**: max 15 markets per group, sorted by liquidity
-- EV range: 2%–15%. Signals ranked by `confidence × EV`
+- EV range: 5%–15%. Signals ranked by `confidence × EV`
+
+**engine/mispricing.py** — `MispricingDetector` — structural mispricing detection (guaranteed mathematical edge). Parses market questions to extract (asset, direction, strike, date) and checks monotonicity constraints:
+- **Strike monotonicity**: P("BTC reach $90k") ≥ P("BTC reach $100k"). Higher strike = lower probability for "reach"; inverse for "dip"
+- **Date monotonicity**: P("BTC reach $100k by March") ≤ P("BTC reach $100k by December"). More time = higher probability
+- Violations ≥ 3¢ generate paired signals (YES on underpriced + NO on overpriced)
+- EV = (gap/2 − spread/2 − slippage) / entry_price. Range: 2%–25%
+- Confidence: 50% violation size + 30% liquidity + 20% volume. Floor: 0.25
+- Mispricing signals are prioritized over leader/lagger signals in execution
+- Supports: btc, eth, oil, gold, sp500 assets
 
 **engine/ws_client.py** — `PolymarketWS` connects to `wss://ws-subscriptions-clob.polymarket.com/ws/market`. Handles price_change, last_trade_price, and book events. Correctly disambiguates YES/NO tokens and converts all prices to YES-denominated. Tracks spread, bid/ask. Callbacks for price changes and whale trades (≥$500). Auto-reconnects on disconnect.
 
@@ -53,7 +62,7 @@ Note: `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are still loaded in CONFIG but
 
 | Table | Purpose |
 |---|---|
-| `arb_signals` | Generated arbitrage signals: market_id, side, ev, group_name, leader info |
+| `arb_signals` | Generated signals: market_id, side, ev, group_name, leader info, signal_type (leader_lagger/mispricing) |
 | `arb_positions` | Arb trades: side, stake, ev, kelly, tp/sl, status, result, pnl, close_reason |
 | `arb_stats` | Singleton (id=1): bankroll, total_pnl, wins, losses |
 

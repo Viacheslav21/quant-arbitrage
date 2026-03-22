@@ -68,6 +68,8 @@ class Database:
                     updated_at TIMESTAMPTZ DEFAULT NOW()
                 );
             """)
+            # Migrations
+            await conn.execute("ALTER TABLE arb_signals ADD COLUMN IF NOT EXISTS signal_type TEXT DEFAULT 'leader_lagger'")
             # Ensure stats row exists
             await conn.execute("""
                 INSERT INTO arb_stats (id, bankroll) VALUES (1, $1)
@@ -81,12 +83,13 @@ class Database:
         async with self.pool.acquire() as conn:
             await conn.execute("""
                 INSERT INTO arb_signals (id, market_id, question, side, side_price, ev,
-                    group_name, leader_question, leader_move, executed)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                    group_name, leader_question, leader_move, executed, signal_type)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
                 ON CONFLICT (id) DO NOTHING
             """, sig["id"], sig["market_id"], sig["question"], sig["side"],
                 sig["side_price"], sig["ev"], sig["group"], sig["leader_q"],
-                sig["leader_move"], sig.get("executed", False))
+                sig["leader_move"], sig.get("executed", False),
+                sig.get("signal_type", "leader_lagger"))
 
     # ── Positions (own table) ──
 
