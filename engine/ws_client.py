@@ -45,13 +45,21 @@ class PolymarketWS:
             if no_token:
                 self._token_to_market[no_token] = mid
                 self._subscribed_tokens.add(no_token)
-            # Initialize price store
+            # Initialize price store — keep yes_token/no_token for later YES/NO disambiguation
             if mid not in self.prices:
                 self.prices[mid] = {
                     "yes_price": m.get("yes_price", 0.5),
                     "question": m.get("question", ""),
+                    "yes_token": yes_token,
+                    "no_token": no_token,
                     "last_update": time.time(),
                 }
+            else:
+                # Update token IDs if missing
+                if yes_token and not self.prices[mid].get("yes_token"):
+                    self.prices[mid]["yes_token"] = yes_token
+                if no_token and not self.prices[mid].get("no_token"):
+                    self.prices[mid]["no_token"] = no_token
 
     async def connect(self):
         """Connect to WebSocket and start listening."""
@@ -159,22 +167,26 @@ class PolymarketWS:
             best_ask = change.get("best_ask")
             if best_bid and best_ask:
                 mid_price = (float(best_bid) + float(best_ask)) / 2
-                # Determine if this is YES or NO token
-                is_yes = any(
-                    m.get("yes_token") == asset_id
-                    for m in [self.prices.get(market_id, {})]
-                    if "yes_token" in m
-                )
-                if market_id in self.prices:
-                    old_price = self.prices[market_id].get("yes_price", 0)
-                    self.prices[market_id]["yes_price"] = round(mid_price, 4)
-                    self.prices[market_id]["best_bid"] = float(best_bid)
-                    self.prices[market_id]["best_ask"] = float(best_ask)
-                    self.prices[market_id]["spread"] = round(float(best_ask) - float(best_bid), 4)
-                    self.prices[market_id]["last_update"] = time.time()
+                spread = round(float(best_ask) - float(best_bid), 4)
 
-                    if self._on_price_change:
-                        await self._on_price_change(market_id, old_price, mid_price)
+                if market_id not in self.prices:
+                    continue
+
+                # Determine if this is YES or NO token
+                is_yes = self.prices[market_id].get("yes_token") == asset_id
+
+                # Convert NO token price to YES price: yes_price = 1 - no_price
+                yes_price = round(mid_price, 4) if is_yes else round(1 - mid_price, 4)
+
+                old_price = self.prices[market_id].get("yes_price", 0)
+                self.prices[market_id]["yes_price"] = yes_price
+                self.prices[market_id]["best_bid"] = float(best_bid) if is_yes else round(1 - float(best_ask), 4)
+                self.prices[market_id]["best_ask"] = float(best_ask) if is_yes else round(1 - float(best_bid), 4)
+                self.prices[market_id]["spread"] = spread
+                self.prices[market_id]["last_update"] = time.time()
+
+                if self._on_price_change:
+                    await self._on_price_change(market_id, old_price, yes_price)
 
     async def _handle_trade(self, data: dict):
         """Handle last_trade_price event — a trade was executed."""
@@ -188,7 +200,11 @@ class PolymarketWS:
         side = data.get("side", "")
 
         if market_id in self.prices:
-            self.prices[market_id]["yes_price"] = round(price, 4)
+            # Convert NO token trade price to YES price
+            is_yes = self.prices[market_id].get("yes_token") == asset_id
+            yes_price = round(price, 4) if is_yes else round(1 - price, 4)
+
+            self.prices[market_id]["yes_price"] = yes_price
             self.prices[market_id]["last_trade_size"] = size
             self.prices[market_id]["last_trade_side"] = side
             self.prices[market_id]["last_update"] = time.time()
@@ -208,11 +224,14 @@ class PolymarketWS:
             best_bid = float(bids[0]["price"])
             best_ask = float(asks[0]["price"])
             mid = (best_bid + best_ask) / 2
+            spread = round(best_ask - best_bid, 4)
             if market_id in self.prices:
-                self.prices[market_id]["yes_price"] = round(mid, 4)
-                self.prices[market_id]["best_bid"] = best_bid
-                self.prices[market_id]["best_ask"] = best_ask
-                self.prices[market_id]["spread"] = round(best_ask - best_bid, 4)
+                is_yes = self.prices[market_id].get("yes_token") == asset_id
+                yes_price = round(mid, 4) if is_yes else round(1 - mid, 4)
+                self.prices[market_id]["yes_price"] = yes_price
+                self.prices[market_id]["best_bid"] = best_bid if is_yes else round(1 - best_ask, 4)
+                self.prices[market_id]["best_ask"] = best_ask if is_yes else round(1 - best_bid, 4)
+                self.prices[market_id]["spread"] = spread
                 self.prices[market_id]["last_update"] = time.time()
 
     def get_price(self, market_id: str) -> float:

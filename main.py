@@ -10,7 +10,6 @@ from engine.groups import assign
 from engine.detector import Detector
 from engine.ws_client import PolymarketWS
 from utils.db import Database
-from utils.telegram import TelegramBot
 
 load_dotenv()
 
@@ -38,7 +37,7 @@ CONFIG = {
 }
 
 
-async def execute_signal(sig: dict, db: Database, telegram: TelegramBot, config: dict):
+async def execute_signal(sig: dict, db: Database, config: dict):
     """Open a position for an arbitrage signal."""
     open_pos = await db.get_open_positions(config["CONFIG_TAG"])
     if len(open_pos) >= config["MAX_OPEN"]:
@@ -51,7 +50,7 @@ async def execute_signal(sig: dict, db: Database, telegram: TelegramBot, config:
             return False
 
     stats = await db.get_stats()
-    bankroll = min(stats.get("bankroll", config["BANKROLL"]), config["BANKROLL"])  # never exceed starting bankroll
+    bankroll = stats.get("bankroll", config["BANKROLL"])
     stake = round(bankroll * config["KELLY_FRAC"], 2)
     stake = min(stake, 50.0)  # hard cap $50 per arb trade
     if stake < 1.0:
@@ -83,18 +82,10 @@ async def execute_signal(sig: dict, db: Database, telegram: TelegramBot, config:
     await db.save_position(pos)
 
     log.info(f"[EXEC] {mode} {sig['side']} '{sig['question'][:50]}' | ${stake} EV:{sig['ev']*100:.1f}% group:{sig['group']}")
-    await telegram.send(
-        f"⚡ <b>ARB SIGNAL [{mode}]</b>\n\n"
-        f"❓ {sig['question'][:150]}\n\n"
-        f"{'✅ YES' if sig['side']=='YES' else '❌ NO'} по <b>{sig['side_price']*100:.1f}¢</b>\n\n"
-        f"📊 EV:<b>+{sig['ev']*100:.1f}%</b> | Group:<b>{sig['group']}</b>\n"
-        f"🔗 Leader: {sig['leader_q']} ({sig['leader_move']*100:+.1f}¢)\n"
-        f"💵 Stake:<b>${stake}</b>"
-    )
     return True
 
 
-async def monitor_positions(db: Database, telegram: TelegramBot, scanner: PolymarketScanner,
+async def monitor_positions(db: Database, scanner: PolymarketScanner,
                              config: dict, markets: list):
     """Monitor open arb positions for TP/SL/timeout."""
     open_pos = await db.get_open_positions(config["CONFIG_TAG"])
@@ -116,15 +107,13 @@ async def monitor_positions(db: Database, telegram: TelegramBot, scanner: Polyma
         pnl_pct = (price - pos["side_price"]) / pos["side_price"]
         close_reason = None
 
-        # Take profit — cap at TP to avoid phantom gains from stale prices
+        # Take profit
         if pnl_pct >= config["TP_PCT"]:
-            pnl_pct = config["TP_PCT"]  # lock at TP, don't overshoot
             close_reason = "TAKE_PROFIT"
 
-        # Breakeven stop: if price returns to entry after initially moving, exit
-        # Allow -1% buffer to avoid noise triggers
-        elif pnl_pct <= -0.01:
-            close_reason = "BREAKEVEN_STOP"
+        # Stop loss
+        elif pnl_pct <= -config["SL_PCT"]:
+            close_reason = "STOP_LOSS"
 
         # Timeout — 30 min max hold
         elif pos.get("opened_at"):
@@ -144,26 +133,16 @@ async def monitor_positions(db: Database, telegram: TelegramBot, scanner: Polyma
 
         emoji = "✅" if result == "WIN" else "❌"
         log.info(f"[CLOSE] {emoji} {close_reason} '{pos['question'][:40]}' PnL:{pnl:+.2f}")
-        await telegram.send(
-            f"{emoji} <b>ARB CLOSE — {close_reason}</b>\n\n"
-            f"❓ {pos['question'][:120]}\n"
-            f"💰 P&L:<b>{pnl:+.2f}$</b> ({pnl_pct*100:+.1f}%)\n"
-            f"📊 {result} | Entry:{pos['side_price']*100:.1f}¢ → Exit:{price*100:.1f}¢"
-        )
 
 
 async def main():
     log.info(f"🚀 Quant Arbitrage starting | {'SIM 🧪' if CONFIG['SIMULATION'] else 'REAL 💰'}")
 
-    db = Database(CONFIG["DATABASE_URL"])
+    db = Database(CONFIG["DATABASE_URL"], starting_bankroll=CONFIG["BANKROLL"])
     await db.init()
-
-    # Clean up any fake PnL from previous runs
-    await db.cleanup_arb_positions(CONFIG["CONFIG_TAG"])
 
     scanner = PolymarketScanner(CONFIG)
     detector = Detector()
-    telegram = TelegramBot(CONFIG["TELEGRAM_TOKEN"], CONFIG["TELEGRAM_CHAT_ID"])
     ws = PolymarketWS()
 
     # Shared state between WS callbacks and main loop
@@ -188,7 +167,7 @@ async def main():
             import signal as _signal
             loop.add_signal_handler(
                 getattr(_signal, sig_name),
-                lambda: asyncio.create_task(_shutdown(db, telegram, scanner, ws)),
+                lambda: asyncio.create_task(_shutdown(db, scanner, ws)),
             )
         except (NotImplementedError, AttributeError):
             pass
@@ -261,12 +240,12 @@ async def main():
 
             # Execute max 1 signal per tick — quality over quantity
             for sig in total_signals[:1]:
-                executed = await execute_signal(sig, db, telegram, CONFIG)
+                executed = await execute_signal(sig, db, CONFIG)
                 if executed:
                     detector.mark_cooldown(sig["market_id"], sig.get("group"))
 
             # Monitor open positions (use WS prices)
-            await monitor_positions(db, telegram, scanner, CONFIG, current_markets)
+            await monitor_positions(db, scanner, CONFIG, current_markets)
 
             # Stats logging every 60 ticks (~4 min)
             if tick % 60 == 0:
@@ -280,18 +259,13 @@ async def main():
         await asyncio.sleep(CONFIG["SCAN_INTERVAL"])
 
 
-async def _shutdown(db, telegram, scanner, ws=None):
+async def _shutdown(db, scanner, ws=None):
     log.info("🛑 Shutting down...")
     if ws:
         ws.stop()
     await scanner.close()
-    await telegram.close()
     await db.close()
 
 
 if __name__ == "__main__":
-    # Bot paused — uncomment to resume
-    import sys
-    print("🛑 Quant Arbitrage is paused. Uncomment main() to resume.")
-    sys.exit(0)
-    # asyncio.run(main())
+    asyncio.run(main())

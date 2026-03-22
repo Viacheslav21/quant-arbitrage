@@ -5,16 +5,17 @@ log = logging.getLogger("db")
 
 
 class Database:
-    """Thin DB layer — connects to shared quant-engine PostgreSQL.
-    Only methods needed for arbitrage bot."""
+    """DB layer for arbitrage bot.
+    Reads shared quant-engine tables (positions, stats) for context.
+    Writes exclusively to own tables (arb_positions, arb_signals, arb_stats)."""
 
-    def __init__(self, url: str):
+    def __init__(self, url: str, starting_bankroll: float = 1000.0):
         self.url = url
         self.pool = None
+        self.starting_bankroll = starting_bankroll
 
     async def init(self):
         self.pool = await asyncpg.create_pool(self.url, min_size=2, max_size=5, command_timeout=30)
-        # Ensure arb_signals table exists (separate from main signals table)
         async with self.pool.acquire() as conn:
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS arb_signals (
@@ -31,7 +32,50 @@ class Database:
                     created_at TIMESTAMPTZ DEFAULT NOW()
                 );
             """)
-        log.info("[DB] Connected to shared database")
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS arb_positions (
+                    id TEXT PRIMARY KEY,
+                    market_id TEXT,
+                    signal_id TEXT,
+                    question TEXT,
+                    group_name TEXT,
+                    side TEXT,
+                    side_price REAL,
+                    ev REAL,
+                    kelly REAL,
+                    stake_amt REAL,
+                    current_price REAL,
+                    unrealized_pnl REAL DEFAULT 0,
+                    tp_pct REAL,
+                    sl_pct REAL,
+                    status TEXT DEFAULT 'open',
+                    result TEXT,
+                    pnl REAL,
+                    payout REAL,
+                    close_reason TEXT,
+                    opened_at TIMESTAMPTZ DEFAULT NOW(),
+                    closed_at TIMESTAMPTZ
+                );
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS arb_stats (
+                    id INTEGER PRIMARY KEY DEFAULT 1,
+                    bankroll REAL DEFAULT 1000,
+                    total_pnl REAL DEFAULT 0,
+                    total_bets INTEGER DEFAULT 0,
+                    wins INTEGER DEFAULT 0,
+                    losses INTEGER DEFAULT 0,
+                    updated_at TIMESTAMPTZ DEFAULT NOW()
+                );
+            """)
+            # Ensure stats row exists
+            await conn.execute("""
+                INSERT INTO arb_stats (id, bankroll) VALUES (1, $1)
+                ON CONFLICT (id) DO NOTHING
+            """, self.starting_bankroll)
+        log.info("[DB] Connected, arb tables ready")
+
+    # ── Signals ──
 
     async def save_arb_signal(self, sig: dict):
         async with self.pool.acquire() as conn:
@@ -44,91 +88,76 @@ class Database:
                 sig["side_price"], sig["ev"], sig["group"], sig["leader_q"],
                 sig["leader_move"], sig.get("executed", False))
 
+    # ── Positions (own table) ──
+
     async def save_position(self, pos: dict):
-        """Save position to shared positions table."""
         async with self.pool.acquire() as conn:
             await conn.execute("""
-                INSERT INTO positions (id, market_id, signal_id, question, theme, side,
-                    side_price, p_final, ev, kl, kelly, stake_amt, current_price, url,
-                    tp_pct, sl_pct, config_tag)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+                INSERT INTO arb_positions (id, market_id, signal_id, question, group_name,
+                    side, side_price, ev, kelly, stake_amt, current_price, tp_pct, sl_pct)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
             """, pos["id"], pos["market_id"], pos.get("signal_id"),
                 pos["question"], pos.get("theme", "arb"), pos["side"],
-                pos["side_price"], pos.get("p_final", 0.5), pos["ev"],
-                0.0, pos["kelly"], pos["stake_amt"], pos["side_price"],
-                "", pos["tp_pct"], pos["sl_pct"], pos["config_tag"])
+                pos["side_price"], pos["ev"], pos["kelly"], pos["stake_amt"],
+                pos["side_price"], pos["tp_pct"], pos["sl_pct"])
 
     async def get_open_positions(self, config_tag: str = None) -> list:
         async with self.pool.acquire() as conn:
-            if config_tag:
-                rows = await conn.fetch(
-                    "SELECT * FROM positions WHERE status='open' AND config_tag=$1 ORDER BY opened_at DESC",
-                    config_tag)
-            else:
-                rows = await conn.fetch(
-                    "SELECT * FROM positions WHERE status='open' ORDER BY opened_at DESC")
+            rows = await conn.fetch(
+                "SELECT * FROM arb_positions WHERE status='open' ORDER BY opened_at DESC")
             return [dict(r) for r in rows]
 
     async def update_position_price(self, pos_id: str, price: float, upnl: float):
         async with self.pool.acquire() as conn:
             await conn.execute(
-                "UPDATE positions SET current_price=$1, unrealized_pnl=$2 WHERE id=$3",
+                "UPDATE arb_positions SET current_price=$1, unrealized_pnl=$2 WHERE id=$3",
                 price, upnl, pos_id)
 
     async def close_position(self, pos_id: str, result: str, pnl: float, payout: float,
                               reason: str, outcome: str = ""):
         async with self.pool.acquire() as conn:
             await conn.execute("""
-                UPDATE positions SET status='closed', result=$1, pnl=$2, payout=$3,
-                    outcome=$4, closed_at=NOW()
+                UPDATE arb_positions SET status='closed', result=$1, pnl=$2, payout=$3,
+                    close_reason=$4, closed_at=NOW()
                 WHERE id=$5
-            """, result, pnl, payout, outcome or reason, pos_id)
+            """, result, pnl, payout, reason, pos_id)
+
+    # ── Stats (own table) ──
 
     async def get_stats(self) -> dict:
         async with self.pool.acquire() as conn:
-            row = await conn.fetchrow("SELECT * FROM stats WHERE id=1")
+            row = await conn.fetchrow("SELECT * FROM arb_stats WHERE id=1")
             if row:
                 return dict(row)
-            return {"bankroll": 1000, "total_pnl": 0, "wins": 0, "losses": 0}
+            return {"bankroll": self.starting_bankroll, "total_pnl": 0, "wins": 0, "losses": 0}
 
     async def update_bankroll(self, pnl: float, result: str):
         async with self.pool.acquire() as conn:
             if result == "WIN":
                 await conn.execute(
-                    "UPDATE stats SET bankroll=bankroll+$1, total_pnl=total_pnl+$1, total_bets=total_bets+1, wins=wins+1, updated_at=NOW() WHERE id=1",
+                    "UPDATE arb_stats SET bankroll=bankroll+$1, total_pnl=total_pnl+$1, total_bets=total_bets+1, wins=wins+1, updated_at=NOW() WHERE id=1",
                     pnl)
             else:
                 await conn.execute(
-                    "UPDATE stats SET bankroll=bankroll+$1, total_pnl=total_pnl+$1, total_bets=total_bets+1, losses=losses+1, updated_at=NOW() WHERE id=1",
+                    "UPDATE arb_stats SET bankroll=bankroll+$1, total_pnl=total_pnl+$1, total_bets=total_bets+1, losses=losses+1, updated_at=NOW() WHERE id=1",
                     pnl)
 
-    async def cleanup_arb_positions(self, config_tag: str = "arb-v1"):
-        """Remove all arb positions and recalculate stats from quant-engine positions only."""
+    # ── Shared tables (read-only) ──
+
+    async def get_shared_stats(self) -> dict:
+        """Read stats from shared quant-engine table (read-only)."""
         async with self.pool.acquire() as conn:
-            # Delete arb positions
-            r1 = await conn.execute("DELETE FROM positions WHERE config_tag = $1", config_tag)
-            r2 = await conn.execute("DELETE FROM arb_signals WHERE TRUE")
+            row = await conn.fetchrow("SELECT * FROM stats WHERE id=1")
+            if row:
+                return dict(row)
+            return {}
 
-            # Recalculate stats from remaining (non-arb) positions
-            row = await conn.fetchrow("""
-                SELECT
-                    COUNT(*) FILTER (WHERE status='closed') as total_bets,
-                    COUNT(*) FILTER (WHERE result='WIN') as wins,
-                    COUNT(*) FILTER (WHERE result='LOSS') as losses,
-                    COALESCE(SUM(pnl) FILTER (WHERE status='closed'), 0) as total_pnl
-                FROM positions
-            """)
-            starting_bankroll = 1000.0  # default
-            bankroll = starting_bankroll + float(row["total_pnl"])
-            await conn.execute("""
-                UPDATE stats SET bankroll=$1, total_pnl=$2, total_bets=$3, wins=$4, losses=$5, updated_at=NOW()
-                WHERE id=1
-            """, bankroll, float(row["total_pnl"]), row["total_bets"], row["wins"], row["losses"])
-
-            log.info(f"[DB] Cleanup: deleted arb positions ({r1}), signals ({r2}). "
-                     f"Recalculated: bankroll=${bankroll:.2f}, pnl=${row['total_pnl']:.2f}, "
-                     f"W:{row['wins']}/L:{row['losses']}")
-            return bankroll
+    async def get_shared_open_positions(self) -> list:
+        """Read open positions from shared quant-engine table (read-only)."""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM positions WHERE status='open' ORDER BY opened_at DESC")
+            return [dict(r) for r in rows]
 
     async def close(self):
         if self.pool:

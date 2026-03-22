@@ -110,13 +110,18 @@ class Detector:
                 side = "NO"
                 side_price = 1 - m["yes_price"]
 
-            # Expected move = fraction of leader's move
-            expected_move = leader["abs_move"] * 0.5
+            # Expected move = fraction of leader's move, minus half-spread (execution cost)
+            spread = m.get("spread", 0)
+            expected_move = leader["abs_move"] * 0.5 - spread / 2
+            if expected_move <= 0:
+                continue
             ev = expected_move / side_price if side_price > 0 else 0
 
             if ev < 0.03:  # skip tiny edge
                 continue
-            ev = min(ev, 0.50)  # cap EV at 50% — anything higher is likely noise
+            if ev > 0.25:  # EV > 25% is almost certainly noise — skip
+                log.warning(f"[DETECT] Suspiciously high EV {ev*100:.1f}% for '{m['question'][:40]}', skipping")
+                continue
 
             signals.append({
                 "market_id":  mid,
