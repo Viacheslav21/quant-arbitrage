@@ -81,7 +81,12 @@ async def execute_signal(sig: dict, db: Database, config: dict):
     await db.save_arb_signal(sig)
     await db.save_position(pos)
 
-    log.info(f"[EXEC] {mode} {sig['side']} '{sig['question'][:50]}' | ${stake} EV:{sig['ev']*100:.1f}% group:{sig['group']}")
+    log.info(
+        f"[EXEC] {mode} {sig['side']} '{sig['question'][:50]}' | ${stake} "
+        f"EV:{sig['ev']*100:.1f}% ρ:{sig.get('correlation',0):.2f} "
+        f"conf:{sig.get('confidence',0):.2f} HL:{sig.get('half_life_m','?')}m "
+        f"group:{sig['group']}"
+    )
     return True
 
 

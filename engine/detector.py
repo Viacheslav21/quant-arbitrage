@@ -1,145 +1,304 @@
 import logging
 import time
+import math
 from collections import deque
 
 log = logging.getLogger("detector")
 
-# Detection parameters
-LEADER_MIN_MOVE = 0.03   # 3¢ minimum move to be a "leader"
-LAGGER_MAX_MOVE = 0.01   # 1¢ max move to be considered "lagging"
-LOOKBACK_TICKS = 6       # ~24 seconds at 4s interval
-MIN_SPREAD = 0.05        # skip markets with spread > 5¢
-MIN_PRICE = 0.10         # skip markets priced < 10¢ (bad risk/reward)
-MAX_PRICE = 0.90         # skip markets priced > 90¢
-COOLDOWN = 300            # 5 min cooldown per market
-GROUP_COOLDOWN = 600      # 10 min cooldown per group after signal
-MAX_HISTORY = 60          # ~4 min of ticks at 4s interval
-WARMUP_TICKS = 30         # ~2 min warmup before detecting
+# ── Timing ──
+LOOKBACK_TICKS = 8        # ~32s at 4s interval for move window
+MIN_HISTORY = 20          # minimum ticks before computing stats (~80s)
+MAX_HISTORY = 120         # ~8 min rolling window
+WARMUP_TICKS = 30         # ~2 min warmup before detection
+COOLDOWN = 300            # 5 min per-market cooldown
+GROUP_COOLDOWN = 600      # 10 min per-group cooldown
+MAX_GROUP_SIZE = 15       # cap markets per group (top by liquidity)
+
+# ── Statistical thresholds ──
+LEADER_Z_THRESHOLD = 2.0  # leader must move ≥ 2σ (statistically significant)
+LAGGER_Z_THRESHOLD = 0.5  # lagger must be quiet (z < 0.5σ)
+MIN_CORRELATION = 0.3     # minimum Pearson ρ to consider a pair
+MIN_VOLATILITY = 0.001    # skip markets with near-zero vol
+
+# ── Price / spread filters ──
+MIN_PRICE = 0.10
+MAX_PRICE = 0.90
+MAX_SPREAD = 0.05         # 5¢
+
+# ── EV / confidence gates ──
+MIN_EV = 0.02             # 2% minimum edge after costs
+MAX_EV = 0.15             # 15% cap — beyond this is model error
+MIN_CONFIDENCE = 0.30     # composite confidence floor
+
+
+class MarketStats:
+    """Rolling price statistics for a single market."""
+    __slots__ = ("prices", "returns")
+
+    def __init__(self):
+        self.prices: deque = deque(maxlen=MAX_HISTORY)    # (timestamp, price)
+        self.returns: deque = deque(maxlen=MAX_HISTORY)   # tick-to-tick Δprice
+
+    def update(self, timestamp: float, price: float):
+        if self.prices:
+            self.returns.append(price - self.prices[-1][1])
+        self.prices.append((timestamp, price))
+
+    @property
+    def ready(self) -> bool:
+        return len(self.returns) >= MIN_HISTORY
+
+    @property
+    def volatility(self) -> float:
+        """Sample standard deviation of returns."""
+        n = len(self.returns)
+        if n < 2:
+            return 0.0
+        mean = sum(self.returns) / n
+        var = sum((r - mean) ** 2 for r in self.returns) / (n - 1)
+        return math.sqrt(var)
+
+    def recent_move(self, lookback: int = LOOKBACK_TICKS) -> float:
+        """Cumulative price change over last *lookback* ticks."""
+        if len(self.prices) < lookback:
+            return 0.0
+        return self.prices[-1][1] - self.prices[-lookback][1]
+
+    def z_score(self, lookback: int = LOOKBACK_TICKS) -> float:
+        """Z-score of recent move: move / σ."""
+        vol = self.volatility
+        if vol < MIN_VOLATILITY:
+            return 0.0
+        return self.recent_move(lookback) / vol
 
 
 class Detector:
     def __init__(self):
-        self.history: dict[str, deque] = {}  # market_id -> deque of (timestamp, yes_price)
-        self._cooldown: dict[str, float] = {}  # market_id -> last signal timestamp
-        self._group_cooldown: dict[str, float] = {}  # group_name -> last signal timestamp
+        self.stats: dict[str, MarketStats] = {}
+        self._cooldown: dict[str, float] = {}
+        self._group_cooldown: dict[str, float] = {}
         self._tick_count: int = 0
 
+    # ── Public API ──
+
     def update(self, markets: list):
-        """Feed new prices for markets."""
+        """Feed latest prices into per-market rolling stats."""
         now = time.time()
         for m in markets:
             mid = m["id"]
-            if mid not in self.history:
-                self.history[mid] = deque(maxlen=MAX_HISTORY)
-            self.history[mid].append((now, m["yes_price"]))
+            if mid not in self.stats:
+                self.stats[mid] = MarketStats()
+            self.stats[mid].update(now, m["yes_price"])
 
     def detect(self, group_name: str, markets: list) -> list:
-        """Detect leader/lagger divergences within a group.
-        Returns list of signal dicts."""
+        """Detect leader/lagger divergences using z-scores, correlation, and OU mean-reversion."""
         now = time.time()
 
-        # Warmup — need enough ticks to establish baseline
         if self._tick_count < WARMUP_TICKS:
             return []
-
-        # Group cooldown — don't spam signals from same group
         if group_name in self._group_cooldown and now - self._group_cooldown[group_name] < GROUP_COOLDOWN:
             return []
 
-        # Clean expired cooldowns
+        # Expire old cooldowns
         self._cooldown = {k: v for k, v in self._cooldown.items() if now - v < COOLDOWN}
 
-        # Calculate recent moves for each market in the group
-        moves = {}
+        # Cap group size — keep most liquid
+        if len(markets) > MAX_GROUP_SIZE:
+            markets = sorted(markets, key=lambda m: m.get("liquidity", 0), reverse=True)[:MAX_GROUP_SIZE]
+
+        # ── 1. Z-scores for every market in the group ──
+        scored: dict[str, dict] = {}
         for m in markets:
             mid = m["id"]
-            hist = self.history.get(mid)
-            if not hist or len(hist) < LOOKBACK_TICKS:
+            st = self.stats.get(mid)
+            if not st or not st.ready:
                 continue
-            old_price = hist[-LOOKBACK_TICKS][1]
-            new_price = m["yes_price"]
-            moves[mid] = {
+            z = st.z_score()
+            scored[mid] = {
                 "market": m,
-                "move": new_price - old_price,
-                "abs_move": abs(new_price - old_price),
+                "z": z,
+                "abs_z": abs(z),
+                "move": st.recent_move(),
+                "vol": st.volatility,
             }
 
-        if len(moves) < 2:
+        if len(scored) < 2:
             return []
 
-        # Find leader: largest absolute move above threshold
+        # ── 2. Find leader (largest |z| ≥ threshold) ──
         leader = None
         leader_mid = None
-        for mid, data in moves.items():
-            if data["abs_move"] >= LEADER_MIN_MOVE:
-                if leader is None or data["abs_move"] > leader["abs_move"]:
+        for mid, data in scored.items():
+            if data["abs_z"] >= LEADER_Z_THRESHOLD:
+                if leader is None or data["abs_z"] > leader["abs_z"]:
                     leader = data
                     leader_mid = mid
 
         if not leader:
             return []
 
-        # Find laggers: markets that haven't moved
+        # ── 3. Evaluate each lagger candidate ──
         signals = []
-        for mid, data in moves.items():
-            if mid == leader_mid:
+        for mid, data in scored.items():
+            if mid == leader_mid or mid in self._cooldown:
                 continue
-            if mid in self._cooldown:
-                continue
-            if data["abs_move"] > LAGGER_MAX_MOVE:
-                continue  # already moving, not a lagger
+            if data["abs_z"] > LAGGER_Z_THRESHOLD:
+                continue  # already moving — not a lagger
+
             m = data["market"]
-            if m.get("spread", 0) > MIN_SPREAD:
-                continue  # too illiquid
-            # Skip extreme prices — bad risk/reward
             if m["yes_price"] < MIN_PRICE or m["yes_price"] > MAX_PRICE:
                 continue
+            if m.get("spread", 0) > MAX_SPREAD:
+                continue
 
-            # Direction: account for inverse correlation
-            # leader direction × lagger direction = expected move direction
+            # ── Correlation ──
+            raw_corr = self._pearson(leader_mid, mid)
             leader_dir = leader["market"].get("direction", 1)
             lagger_dir = m.get("direction", 1)
-            # same×same=1 (follow), same×inverse=-1 (opposite), inverse×inverse=1 (follow)
-            correlation = leader_dir * lagger_dir
+            eff_corr = raw_corr * leader_dir * lagger_dir
+
+            if abs(eff_corr) < MIN_CORRELATION:
+                continue
+
+            # ── OU half-life — skip if too slow to converge ──
+            hl_ticks = self._ou_half_life(leader_mid, mid)
+            timeout_ticks = 30 * 60 / 4  # 450 ticks = 30 min
+            if hl_ticks > timeout_ticks:
+                continue
+
+            # ── Expected move (OU-informed) ──
+            # Hold for min(timeout, 3 × half-life) — captures ~87.5 % of convergence
+            hold_ticks = min(timeout_ticks, hl_ticks * 3)
+            decay = 1 - math.exp(-math.log(2) * hold_ticks / hl_ticks)
+            expected_move = abs(leader["move"]) * abs(eff_corr) * decay
+
+            # Subtract half-spread (execution cost)
+            spread_cost = m.get("spread", 0) / 2
+            net_move = expected_move - spread_cost
+            if net_move <= 0:
+                continue
+
+            # ── Side ──
             leader_up = leader["move"] > 0
-
-            if (leader_up and correlation > 0) or (not leader_up and correlation < 0):
-                side = "YES"
-                side_price = m["yes_price"]
+            if (leader_up and eff_corr > 0) or (not leader_up and eff_corr < 0):
+                side, side_price = "YES", m["yes_price"]
             else:
-                side = "NO"
-                side_price = 1 - m["yes_price"]
-
-            # Expected move = fraction of leader's move, minus half-spread (execution cost)
-            spread = m.get("spread", 0)
-            expected_move = leader["abs_move"] * 0.5 - spread / 2
-            if expected_move <= 0:
+                side, side_price = "NO", 1 - m["yes_price"]
+            if side_price <= 0:
                 continue
-            ev = expected_move / side_price if side_price > 0 else 0
 
-            if ev < 0.03:  # skip tiny edge
+            ev = net_move / side_price
+            if ev < MIN_EV:
                 continue
-            if ev > 0.25:  # EV > 25% is almost certainly noise — skip
-                log.warning(f"[DETECT] Suspiciously high EV {ev*100:.1f}% for '{m['question'][:40]}', skipping")
+            if ev > MAX_EV:
+                log.debug(f"[DETECT] EV {ev*100:.1f}% exceeds cap for '{m['question'][:40]}', skip")
+                continue
+
+            # ── Composite confidence ──
+            # 40 % correlation + 30 % leader z-significance + 20 % liquidity + 10 % OU decay
+            conf = (
+                min(abs(eff_corr), 1.0) * 0.40
+                + min(leader["abs_z"] / 3.0, 1.0) * 0.30
+                + min(m.get("liquidity", 0) / 50_000, 1.0) * 0.20
+                + decay * 0.10
+            )
+            if conf < MIN_CONFIDENCE:
                 continue
 
             signals.append({
-                "market_id":  mid,
-                "question":   m["question"],
-                "side":       side,
-                "side_price": round(side_price, 4),
-                "yes_price":  m["yes_price"],
-                "ev":         round(ev, 4),
-                "group":      group_name,
-                "leader_q":   leader["market"]["question"][:60],
+                "market_id":   mid,
+                "question":    m["question"],
+                "side":        side,
+                "side_price":  round(side_price, 4),
+                "yes_price":   m["yes_price"],
+                "ev":          round(ev, 4),
+                "group":       group_name,
+                "leader_q":    leader["market"]["question"][:60],
                 "leader_move": round(leader["move"], 4),
-                "spread":     m.get("spread", 0),
+                "leader_z":    round(leader["z"], 2),
+                "correlation": round(eff_corr, 3),
+                "half_life_m": round(hl_ticks * 4 / 60, 1),  # minutes
+                "confidence":  round(conf, 3),
+                "spread":      m.get("spread", 0),
             })
 
+        # Rank by risk-adjusted edge: confidence × EV
+        signals.sort(key=lambda s: s["confidence"] * s["ev"], reverse=True)
         return signals
 
     def mark_cooldown(self, market_id: str, group_name: str = None):
-        """Mark market and group as recently signaled."""
         self._cooldown[market_id] = time.time()
         if group_name:
             self._group_cooldown[group_name] = time.time()
+
+    # ── Private helpers ──
+
+    def _pearson(self, mid_a: str, mid_b: str) -> float:
+        """Rolling Pearson correlation between two markets' return series."""
+        sa = self.stats.get(mid_a)
+        sb = self.stats.get(mid_b)
+        if not sa or not sb or not sa.ready or not sb.ready:
+            return 0.0
+
+        n = min(len(sa.returns), len(sb.returns))
+        if n < 10:
+            return 0.0
+
+        ra = list(sa.returns)[-n:]
+        rb = list(sb.returns)[-n:]
+
+        mean_a = sum(ra) / n
+        mean_b = sum(rb) / n
+
+        cov = sum((a - mean_a) * (b - mean_b) for a, b in zip(ra, rb)) / (n - 1)
+        var_a = sum((a - mean_a) ** 2 for a in ra) / (n - 1)
+        var_b = sum((b - mean_b) ** 2 for b in rb) / (n - 1)
+
+        if var_a <= 0 or var_b <= 0:
+            return 0.0
+        return cov / math.sqrt(var_a * var_b)
+
+    def _ou_half_life(self, mid_a: str, mid_b: str) -> float:
+        """Ornstein-Uhlenbeck half-life of the pair spread.
+
+        Regresses ΔS_t = α + β·S_{t-1}.  For a mean-reverting spread β < 0
+        and half_life = −ln(2) / ln(1 + β).  Returns ticks (× 4 for seconds).
+        """
+        sa = self.stats.get(mid_a)
+        sb = self.stats.get(mid_b)
+        if not sa or not sb:
+            return float("inf")
+
+        n = min(len(sa.prices), len(sb.prices))
+        if n < 15:
+            return float("inf")
+
+        pa = [sa.prices[len(sa.prices) - n + i][1] for i in range(n)]
+        pb = [sb.prices[len(sb.prices) - n + i][1] for i in range(n)]
+        spreads = [a - b for a, b in zip(pa, pb)]
+
+        # OLS:  ΔS = α + β * S_{t-1}
+        delta = [spreads[i] - spreads[i - 1] for i in range(1, len(spreads))]
+        lag = spreads[:-1]
+        k = len(delta)
+        if k < 5:
+            return float("inf")
+
+        mx = sum(lag) / k
+        my = sum(delta) / k
+        ss_xx = sum((x - mx) ** 2 for x in lag)
+        ss_xy = sum((x - mx) * (y - my) for x, y in zip(lag, delta))
+
+        if ss_xx == 0:
+            return float("inf")
+
+        beta = ss_xy / ss_xx
+        if beta >= 0:
+            return float("inf")  # not mean-reverting
+
+        try:
+            hl = -math.log(2) / math.log(1 + beta)
+        except (ValueError, ZeroDivisionError):
+            return float("inf")
+
+        return max(hl, 1.0)
