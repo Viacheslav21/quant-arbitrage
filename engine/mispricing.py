@@ -19,15 +19,42 @@ COOLDOWN_SEC = 600        # 10 min per-market
 # ── Question parsing ──
 
 ASSET_PATTERNS = [
+    # Crypto
     (re.compile(r"(?:bitcoin|btc)", re.I), "btc"),
     (re.compile(r"(?:ethereum|eth)\b", re.I), "eth"),
+    (re.compile(r"(?:solana|sol)\b", re.I), "sol"),
+    (re.compile(r"(?:dogecoin|doge)\b", re.I), "doge"),
+    (re.compile(r"(?:xrp|ripple)\b", re.I), "xrp"),
+    # Commodities
     (re.compile(r"(?:crude\s*oil|oil\s*\(?cl\)?|brent|wti)", re.I), "oil"),
-    (re.compile(r"(?:gold|xau)", re.I), "gold"),
-    (re.compile(r"(?:s&p\s*500|sp500)", re.I), "sp500"),
+    (re.compile(r"(?:gold|xau|\(?gc\)?)", re.I), "gold"),
+    (re.compile(r"(?:silver|xag|\(?si\)?)", re.I), "silver"),
+    (re.compile(r"(?:natural\s*gas|\(?ng\)?)", re.I), "natgas"),
+    # Indices & stocks
+    (re.compile(r"(?:s&p\s*500|sp500|spx)", re.I), "sp500"),
+    (re.compile(r"(?:nasdaq|qqq)", re.I), "nasdaq"),
+    (re.compile(r"(?:dow\s*jones|djia)", re.I), "dow"),
+    (re.compile(r"(?:tesla|tsla)\b", re.I), "tesla"),
+    (re.compile(r"(?:nvidia|nvda)\b", re.I), "nvidia"),
+    (re.compile(r"(?:apple|aapl)\b", re.I), "apple"),
+    # Macro
+    (re.compile(r"(?:fed\s*(?:funds?\s*)?rate|interest\s*rate)", re.I), "fedrate"),
+    (re.compile(r"(?:unemployment\s*(?:rate)?)", re.I), "unemployment"),
+    (re.compile(r"(?:inflation|cpi)\b", re.I), "inflation"),
+    (re.compile(r"(?:gdp)\b", re.I), "gdp"),
+    # Politics
+    (re.compile(r"(?:trump\s*approval)", re.I), "trump_approval"),
+    (re.compile(r"(?:biden\s*approval)", re.I), "biden_approval"),
+    # Forex
+    (re.compile(r"(?:eur/?usd)", re.I), "eurusd"),
+    (re.compile(r"(?:usd/?jpy)", re.I), "usdjpy"),
+    # Other metrics with numbers
+    (re.compile(r"(?:twitter|x\.com)\s*(?:followers|posts|tweets)", re.I), "tweets"),
+    (re.compile(r"(?:subscribers|views|downloads)", re.I), "metric"),
 ]
 
-REACH_RE = re.compile(r"(?:reach|hit\s*\(?high\)?|above|exceed|surpass)", re.I)
-DIP_RE = re.compile(r"(?:dip\s*to|hit\s*\(?low\)?|below|drop\s*to|fall\s*to)", re.I)
+REACH_RE = re.compile(r"(?:reach|hit\s*\(?high\)?|above|exceed|surpass|over|top)", re.I)
+DIP_RE = re.compile(r"(?:dip\s*to|hit\s*\(?low\)?|below|drop\s*to|fall\s*to|under)", re.I)
 STRIKE_RE = re.compile(r"\$\s*([\d,]+(?:\.\d+)?)\s*([kK])?\b")
 
 MONTH_MAP = {
