@@ -28,8 +28,8 @@ CONFIG = {
     "SIMULATION":      os.getenv("SIMULATION", "true").lower() == "true",
     "SCAN_INTERVAL":   int(os.getenv("ARB_SCAN_INTERVAL", "4")),
     "FULL_SCAN_EVERY": int(os.getenv("ARB_FULL_SCAN_EVERY", "8")),  # full fetch every N ticks
-    "TP_PCT":          float(os.getenv("ARB_TP_PCT", "0.08")),
-    "SL_PCT":          float(os.getenv("ARB_SL_PCT", "0.05")),
+    "TP_PCT":          float(os.getenv("ARB_TP_PCT", "0.10")),
+    "SL_PCT":          float(os.getenv("ARB_SL_PCT", "0.04")),
     "TIMEOUT_MIN":     int(os.getenv("ARB_TIMEOUT_MIN", "30")),
     "MIN_VOLUME":      float(os.getenv("MIN_VOLUME", "50000")),
     "MAX_OPEN":        int(os.getenv("ARB_MAX_OPEN", "10")),
@@ -48,6 +48,7 @@ async def execute_signal(sig: dict, db: Database, config: dict):
     # Check if already have position on this market
     for p in open_pos:
         if p["market_id"] == sig["market_id"]:
+            log.debug(f"[EXEC] skip '{sig['question'][:35]}': already have open position")
             return False
 
     stats = await db.get_stats()
@@ -55,6 +56,7 @@ async def execute_signal(sig: dict, db: Database, config: dict):
     stake = round(bankroll * config["KELLY_FRAC"], 2)
     stake = min(stake, 50.0)  # hard cap $50 per arb trade
     if stake < 1.0:
+        log.warning(f"[EXEC] stake ${stake:.2f} too low (bankroll: ${bankroll:.2f}), skipping")
         return False
 
     mode = "🧪 SIM" if config["SIMULATION"] else "💰 REAL"
@@ -147,11 +149,19 @@ async def monitor_positions(db: Database, scanner: PolymarketScanner,
         await db.update_bankroll(pnl, result)
 
         emoji = "✅" if result == "WIN" else "❌"
-        log.info(f"[CLOSE] {emoji} {close_reason} '{pos['question'][:40]}' PnL:{pnl:+.2f}")
+        age_str = ""
+        if pos.get("opened_at"):
+            age_m = (datetime.now(timezone.utc) - pos["opened_at"]).total_seconds() / 60
+            age_str = f" age:{age_m:.0f}m"
+        log.info(f"[CLOSE] {emoji} {close_reason} '{pos['question'][:40]}' PnL:{pnl:+.2f} entry:{pos['side_price']:.4f}→{price:.4f} ({pnl_pct*100:+.1f}%){age_str}")
 
 
 async def main():
     log.info(f"🚀 Quant Arbitrage starting | {'SIM 🧪' if CONFIG['SIMULATION'] else 'REAL 💰'}")
+    log.info(f"[CONFIG] TP:{CONFIG['TP_PCT']*100:.0f}% SL:{CONFIG['SL_PCT']*100:.0f}% "
+             f"timeout:{CONFIG['TIMEOUT_MIN']}m kelly:{CONFIG['KELLY_FRAC']*100:.0f}% "
+             f"max_open:{CONFIG['MAX_OPEN']} scan:{CONFIG['SCAN_INTERVAL']}s "
+             f"bankroll:${CONFIG['BANKROLL']:.0f}")
 
     db = Database(CONFIG["DATABASE_URL"], starting_bankroll=CONFIG["BANKROLL"])
     await db.init()
@@ -234,6 +244,7 @@ async def main():
                             [m["yes_token"] for m in new_grouped if m.get("yes_token")] +
                             [m["no_token"] for m in new_grouped if m.get("no_token")]
                         )
+                        log.info(f"[RESCAN] +{len(new_grouped)} new markets added to WS")
                     log.info(f"[RESCAN] {len(markets)} markets, {len(grouped_ids)} in {len(groups)} groups")
 
             # Update market prices from WebSocket data
@@ -264,6 +275,11 @@ async def main():
                 reverse=True,
             )
 
+            mp_count = sum(1 for s in total_signals if s.get("signal_type") == "mispricing")
+            ll_count = len(total_signals) - mp_count
+            if total_signals:
+                log.debug(f"[SIGNALS] {len(total_signals)} total ({mp_count} mispricing, {ll_count} leader/lagger)")
+
             # Execute max 1 signal per tick — quality over quantity
             for sig in total_signals[:1]:
                 executed = await execute_signal(sig, db, CONFIG)
@@ -280,7 +296,32 @@ async def main():
             if tick % 60 == 0:
                 open_pos = await db.get_open_positions(CONFIG["CONFIG_TAG"])
                 ws_active = len([1 for p in ws.prices.values() if time.time() - p.get("last_update", 0) < 30])
-                log.info(f"[TICK #{tick}] {len(groups)} groups | {ws_active} WS live | {len(open_pos)} open positions")
+                stats = await db.get_stats()
+                bankroll = stats.get("bankroll", CONFIG["BANKROLL"])
+                total_pnl = stats.get("total_pnl", 0)
+                wins = stats.get("wins", 0)
+                losses = stats.get("losses", 0)
+                total_bets = stats.get("total_bets", 0)
+                wr = f"{wins/(wins+losses)*100:.0f}%" if (wins+losses) > 0 else "n/a"
+                upnl = sum(p.get("unrealized_pnl", 0) for p in open_pos)
+                ready_stats = sum(1 for s in detector.stats.values() if s.ready)
+                log.info(
+                    f"[TICK #{tick}] {len(groups)} groups | {ws_active} WS live | "
+                    f"{len(open_pos)} open (uPnL:{upnl:+.2f}) | "
+                    f"bankroll:${bankroll:.2f} PnL:${total_pnl:+.2f} | "
+                    f"W/L:{wins}/{losses} ({wr}) bets:{total_bets} | "
+                    f"stats ready:{ready_stats}/{len(detector.stats)}"
+                )
+                # Log individual open positions
+                for p in open_pos:
+                    age_m = 0
+                    if p.get("opened_at"):
+                        age_m = (datetime.now(timezone.utc) - p["opened_at"]).total_seconds() / 60
+                    log.info(
+                        f"  📊 {p['side']} '{p['question'][:40]}' "
+                        f"entry:{p['side_price']:.4f} now:{p.get('current_price',0):.4f} "
+                        f"uPnL:{p.get('unrealized_pnl',0):+.2f} age:{age_m:.0f}m"
+                    )
 
         except Exception as e:
             log.error(f"[MAIN] {e}", exc_info=True)

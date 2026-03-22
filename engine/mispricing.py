@@ -11,10 +11,11 @@ MIN_LIQUIDITY = 5000
 MIN_VOLUME = 10000
 MIN_PRICE = 0.05
 MAX_PRICE = 0.95
-MIN_EV = 0.02             # 2% floor (structural edge is more reliable)
+MIN_EV = 0.05             # 5% floor — lower EVs are noise after costs
 MAX_EV = 0.25             # 25% cap
 MIN_CONFIDENCE = 0.25
 COOLDOWN_SEC = 600        # 10 min per-market
+MAX_DAILY_TRADES = 3      # max trades per market per day
 
 # ── Question parsing ──
 
@@ -143,27 +144,43 @@ class MispricingDetector:
 
     def __init__(self):
         self._cooldown: dict[str, float] = {}
+        self._daily_trades: dict[str, int] = {}  # market_id -> count today
+        self._daily_reset_day: int = 0
 
     def detect(self, markets: list) -> list:
         """Find monotonicity violations across all markets."""
         now = time.time()
         self._cooldown = {k: v for k, v in self._cooldown.items() if now - v < COOLDOWN_SEC}
 
+        # Reset daily trade counts at midnight
+        from datetime import datetime, timezone
+        today = datetime.now(timezone.utc).toordinal()
+        if today != self._daily_reset_day:
+            self._daily_trades.clear()
+            self._daily_reset_day = today
+
         # Parse all markets
         parsed = []
+        skipped = {"price": 0, "spread": 0, "liquidity": 0, "volume": 0, "parse": 0}
         for m in markets:
             if m["yes_price"] < MIN_PRICE or m["yes_price"] > MAX_PRICE:
+                skipped["price"] += 1
                 continue
             if m.get("spread", 1) > MAX_SPREAD:
+                skipped["spread"] += 1
                 continue
             if m.get("liquidity", 0) < MIN_LIQUIDITY:
+                skipped["liquidity"] += 1
                 continue
             if m.get("volume", 0) < MIN_VOLUME:
+                skipped["volume"] += 1
                 continue
             info = _parse_market(m["question"])
             if not info:
+                skipped["parse"] += 1
                 continue
             parsed.append({"market": m, **info})
+        log.debug(f"[MISPRICING] parsed {len(parsed)}/{len(markets)} markets (skip: {skipped})")
 
         # Group into constraint families
         # Type A: same (asset, direction, date_bucket) — varying strikes
@@ -181,6 +198,10 @@ class MispricingDetector:
                 key_b = (p["asset"], p["direction"], p["strike"])
                 date_families.setdefault(key_b, []).append(p)
 
+        strike_fam_count = sum(1 for f in strike_families.values() if len(f) >= 2)
+        date_fam_count = sum(1 for f in date_families.values() if len(f) >= 2)
+        log.debug(f"[MISPRICING] {strike_fam_count} strike families, {date_fam_count} date families")
+
         signals = []
 
         # Check strike monotonicity
@@ -188,14 +209,20 @@ class MispricingDetector:
             if len(family) < 2:
                 continue
             family.sort(key=lambda x: x["strike"])
-            signals.extend(self._check_strike(family, now))
+            sigs = self._check_strike(family, now)
+            if sigs:
+                log.debug(f"[MISPRICING] strike violation {key}: {len(sigs)} signals")
+            signals.extend(sigs)
 
         # Check date monotonicity
         for key, family in date_families.items():
             if len(family) < 2:
                 continue
             family.sort(key=lambda x: x["date_key"])
-            signals.extend(self._check_date(family, now))
+            sigs = self._check_date(family, now)
+            if sigs:
+                log.debug(f"[MISPRICING] date violation {key}: {len(sigs)} signals")
+            signals.extend(sigs)
 
         # Deduplicate by market_id (keep highest EV)
         seen: dict[str, dict] = {}
@@ -206,6 +233,10 @@ class MispricingDetector:
         signals = list(seen.values())
 
         signals.sort(key=lambda s: s.get("confidence", 0) * s["ev"], reverse=True)
+        if signals:
+            log.info(f"[MISPRICING] {len(signals)} signal(s) | top: EV={signals[0]['ev']*100:.1f}% conf={signals[0]['confidence']:.2f} '{signals[0]['question'][:40]}'")
+        else:
+            log.debug(f"[MISPRICING] no signals this tick")
         return signals
 
     def _check_strike(self, family: list, now: float) -> list:
@@ -280,27 +311,42 @@ class MispricingDetector:
             + min(min_vol / 100_000, 1.0) * 0.20
         )
         if confidence < MIN_CONFIDENCE:
+            log.debug(f"[MISPRICING] skip: conf={confidence:.2f} < {MIN_CONFIDENCE} | {reason}")
             return []
 
         # Buy YES on underpriced
         mid = underpriced["id"]
-        if mid not in self._cooldown:
+        daily_count = self._daily_trades.get(mid, 0)
+        if mid in self._cooldown:
+            log.debug(f"[MISPRICING] skip YES '{underpriced['question'][:35]}': cooldown")
+        elif daily_count >= MAX_DAILY_TRADES:
+            log.debug(f"[MISPRICING] skip YES '{underpriced['question'][:35]}': daily cap ({daily_count}/{MAX_DAILY_TRADES})")
+        else:
             price = underpriced["yes_price"]
             spread = underpriced.get("spread", 0)
             ev = (gap / 2 - spread / 2 - 0.005) / price if price > 0 else 0
             if MIN_EV <= ev <= MAX_EV:
                 signals.append(self._signal(
                     underpriced, "YES", price, ev, gap, confidence, reason, spread))
+            elif ev < MIN_EV:
+                log.debug(f"[MISPRICING] skip YES '{underpriced['question'][:35]}': EV={ev*100:.1f}% < {MIN_EV*100:.0f}%")
 
         # Buy NO on overpriced
         mid = overpriced["id"]
-        if mid not in self._cooldown:
+        daily_count = self._daily_trades.get(mid, 0)
+        if mid in self._cooldown:
+            log.debug(f"[MISPRICING] skip NO '{overpriced['question'][:35]}': cooldown")
+        elif daily_count >= MAX_DAILY_TRADES:
+            log.debug(f"[MISPRICING] skip NO '{overpriced['question'][:35]}': daily cap ({daily_count}/{MAX_DAILY_TRADES})")
+        else:
             price = 1 - overpriced["yes_price"]
             spread = overpriced.get("spread", 0)
             ev = (gap / 2 - spread / 2 - 0.005) / price if price > 0 else 0
             if MIN_EV <= ev <= MAX_EV:
                 signals.append(self._signal(
                     overpriced, "NO", price, ev, gap, confidence, reason, spread))
+            elif ev < MIN_EV:
+                log.debug(f"[MISPRICING] skip NO '{overpriced['question'][:35]}': EV={ev*100:.1f}% < {MIN_EV*100:.0f}%")
 
         return signals
 
@@ -322,3 +368,5 @@ class MispricingDetector:
 
     def mark_cooldown(self, market_id: str):
         self._cooldown[market_id] = time.time()
+        self._daily_trades[market_id] = self._daily_trades.get(market_id, 0) + 1
+        log.info(f"[MISPRICING] cooldown set for {market_id[:8]} (daily: {self._daily_trades[market_id]}/{MAX_DAILY_TRADES})")

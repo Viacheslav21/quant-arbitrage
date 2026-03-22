@@ -7,7 +7,7 @@ log = logging.getLogger("detector")
 
 # ── Timing ──
 LOOKBACK_TICKS = 8        # ~32s at 4s interval for move window
-MIN_HISTORY = 100         # minimum ticks before computing stats (~7 min)
+MIN_HISTORY = 60          # minimum ticks before computing stats (~4 min, was 100)
 MAX_HISTORY = 500         # ~33 min rolling window
 WARMUP_TICKS = 30         # ~2 min warmup before detection
 COOLDOWN = 300            # 5 min per-market cooldown
@@ -15,10 +15,10 @@ GROUP_COOLDOWN = 600      # 10 min per-group cooldown
 MAX_GROUP_SIZE = 15       # cap markets per group (top by liquidity)
 
 # ── Statistical thresholds ──
-LEADER_Z_THRESHOLD = 2.0  # leader must move ≥ 2σ (statistically significant)
-LAGGER_Z_THRESHOLD = 0.5  # lagger must be quiet (z < 0.5σ)
-MIN_CORRELATION = 0.35    # minimum Pearson ρ to consider a pair
-MIN_VOLATILITY = 0.001    # skip markets with near-zero vol
+LEADER_Z_THRESHOLD = 1.5  # leader must move ≥ 1.5σ (relaxed from 2.0 — prediction markets move slowly)
+LAGGER_Z_THRESHOLD = 0.7  # lagger must be relatively quiet (relaxed from 0.5)
+MIN_CORRELATION = 0.25    # minimum Pearson ρ (relaxed from 0.35 — prediction markets are weakly correlated)
+MIN_VOLATILITY = 0.0005   # skip markets with near-zero vol (relaxed from 0.001)
 
 # ── Price / spread filters ──
 MIN_PRICE = 0.10
@@ -95,8 +95,11 @@ class Detector:
         now = time.time()
 
         if self._tick_count < WARMUP_TICKS:
+            log.debug(f"[DETECT] {group_name}: warming up ({self._tick_count}/{WARMUP_TICKS})")
             return []
         if group_name in self._group_cooldown and now - self._group_cooldown[group_name] < GROUP_COOLDOWN:
+            remaining = GROUP_COOLDOWN - (now - self._group_cooldown[group_name])
+            log.debug(f"[DETECT] {group_name}: group cooldown ({remaining:.0f}s remaining)")
             return []
 
         # Expire old cooldowns
@@ -122,7 +125,11 @@ class Detector:
                 "vol": st.volatility,
             }
 
+        not_ready = len(markets) - len(scored)
+        if not_ready > 0:
+            log.debug(f"[DETECT] {group_name}: {len(scored)}/{len(markets)} markets ready ({not_ready} still collecting)")
         if len(scored) < 2:
+            log.debug(f"[DETECT] {group_name}: need ≥2 scored markets, have {len(scored)}")
             return []
 
         # ── 2. Find leader (largest |z| ≥ threshold) ──
@@ -135,20 +142,32 @@ class Detector:
                     leader_mid = mid
 
         if not leader:
+            log.debug(f"[DETECT] {group_name}: no leader found (max |z|={max((d['abs_z'] for d in scored.values()), default=0):.2f}, need {LEADER_Z_THRESHOLD})")
             return []
+
+        log.debug(f"[DETECT] {group_name}: leader '{leader['market']['question'][:40]}' z={leader['z']:.2f}")
 
         # ── 3. Evaluate each lagger candidate ──
         signals = []
+        candidates = len([mid for mid in scored if mid != leader_mid and mid not in self._cooldown])
+        log.debug(f"[DETECT] {group_name}: evaluating {candidates} lagger candidates")
         for mid, data in scored.items():
-            if mid == leader_mid or mid in self._cooldown:
+            if mid == leader_mid:
                 continue
+            if mid in self._cooldown:
+                log.debug(f"[DETECT] skip '{data['market']['question'][:35]}': cooldown")
+                continue
+            q_short = data["market"]["question"][:35]
             if data["abs_z"] > LAGGER_Z_THRESHOLD:
-                continue  # already moving — not a lagger
+                log.debug(f"[DETECT] skip '{q_short}': |z|={data['abs_z']:.2f} > {LAGGER_Z_THRESHOLD} (already moving)")
+                continue
 
             m = data["market"]
             if m["yes_price"] < MIN_PRICE or m["yes_price"] > MAX_PRICE:
+                log.debug(f"[DETECT] skip '{q_short}': price {m['yes_price']:.2f} out of range")
                 continue
             if m.get("spread", 0) > MAX_SPREAD:
+                log.debug(f"[DETECT] skip '{q_short}': spread {m.get('spread',0):.3f} > {MAX_SPREAD}")
                 continue
 
             # ── Correlation ──
@@ -158,12 +177,14 @@ class Detector:
             eff_corr = raw_corr * leader_dir * lagger_dir
 
             if abs(eff_corr) < MIN_CORRELATION:
+                log.debug(f"[DETECT] skip '{q_short}': |ρ|={abs(eff_corr):.3f} < {MIN_CORRELATION}")
                 continue
 
             # ── OU half-life — skip if too slow to converge ──
             hl_ticks = self._ou_half_life(leader_mid, mid)
             timeout_ticks = 30 * 60 / 4  # 450 ticks = 30 min
             if hl_ticks > timeout_ticks:
+                log.debug(f"[DETECT] skip '{q_short}': OU HL={hl_ticks:.0f} ticks > timeout {timeout_ticks:.0f}")
                 continue
 
             # ── Expected move (OU-informed) ──
@@ -177,6 +198,7 @@ class Detector:
             slippage = 0.005
             net_move = expected_move - spread_cost - slippage
             if net_move <= 0:
+                log.debug(f"[DETECT] skip '{q_short}': net_move={net_move:.4f} ≤ 0 (exp={expected_move:.4f} cost={spread_cost+slippage:.4f})")
                 continue
 
             # ── Side ──
@@ -190,9 +212,10 @@ class Detector:
 
             ev = net_move / side_price
             if ev < MIN_EV:
+                log.debug(f"[DETECT] skip '{q_short}': EV={ev*100:.1f}% < {MIN_EV*100:.0f}%")
                 continue
             if ev > MAX_EV:
-                log.debug(f"[DETECT] EV {ev*100:.1f}% exceeds cap for '{m['question'][:40]}', skip")
+                log.debug(f"[DETECT] skip '{q_short}': EV={ev*100:.1f}% > cap {MAX_EV*100:.0f}%")
                 continue
 
             # ── Composite confidence ──
@@ -204,8 +227,10 @@ class Detector:
                 + decay * 0.10
             )
             if conf < MIN_CONFIDENCE:
+                log.debug(f"[DETECT] skip '{q_short}': conf={conf:.2f} < {MIN_CONFIDENCE}")
                 continue
 
+            log.info(f"[DETECT] ✓ SIGNAL '{q_short}' {side} | ρ={eff_corr:.3f} z={leader['z']:.2f} EV={ev*100:.1f}% conf={conf:.2f} HL={hl_ticks*4/60:.1f}m")
             signals.append({
                 "market_id":   mid,
                 "question":    m["question"],
@@ -225,6 +250,8 @@ class Detector:
 
         # Rank by risk-adjusted edge: confidence × EV
         signals.sort(key=lambda s: s["confidence"] * s["ev"], reverse=True)
+        if signals:
+            log.info(f"[DETECT] {group_name}: {len(signals)} leader/lagger signal(s) found")
         return signals
 
     def mark_cooldown(self, market_id: str, group_name: str = None):
