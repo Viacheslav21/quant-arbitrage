@@ -36,7 +36,7 @@ Note: `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are still loaded in CONFIG but
 **engine/detector.py** — `Detector` — statistical signal engine. Core models:
 - **MarketStats**: per-market rolling statistics (prices, returns, volatility, z-scores) over 120-tick window (~8 min). Minimum 40 ticks (~160s) before stats are considered ready
 - **Z-score detection**: leader needs |z| ≥ 2.0 (statistically significant move), lagger must have |z| < 0.5
-- **Pearson correlation**: rolling ρ between market return series, minimum ρ ≥ 0.5 to consider a pair
+- **Pearson correlation**: rolling ρ between market return series, minimum ρ ≥ 0.35 to consider a pair
 - **Ornstein-Uhlenbeck half-life**: OLS regression on pair spread (ΔS = α + β·S) estimates mean-reversion speed. Skips pairs where half-life exceeds timeout
 - **EV formula**: `expected_move = |leader_move| × |ρ| × (1 − e^(−ln2 × hold/HL)) − spread/2`, then `ev = expected_move / entry_price`
 - **Composite confidence**: 40% correlation + 30% z-significance + 20% liquidity + 10% OU decay. Floor: 0.30

@@ -17,7 +17,7 @@ MAX_GROUP_SIZE = 15       # cap markets per group (top by liquidity)
 # ── Statistical thresholds ──
 LEADER_Z_THRESHOLD = 2.0  # leader must move ≥ 2σ (statistically significant)
 LAGGER_Z_THRESHOLD = 0.5  # lagger must be quiet (z < 0.5σ)
-MIN_CORRELATION = 0.5     # minimum Pearson ρ to consider a pair
+MIN_CORRELATION = 0.35    # minimum Pearson ρ to consider a pair
 MIN_VOLATILITY = 0.001    # skip markets with near-zero vol
 
 # ── Price / spread filters ──
