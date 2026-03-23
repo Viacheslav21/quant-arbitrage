@@ -41,7 +41,9 @@ class PolymarketScanner:
                     liq = float(m.get("liquidity") or 0)
                     if vol < self.config["MIN_VOLUME"] or liq < 5000:
                         continue
-                    raw_prices = m.get("outcomePrices") or ["0.5", "0.5"]
+                    raw_prices = m.get("outcomePrices")
+                    if not raw_prices:
+                        continue  # skip markets with no price data
                     if isinstance(raw_prices, str):
                         raw_prices = _json.loads(raw_prices)
                     yes_price = float(raw_prices[0])

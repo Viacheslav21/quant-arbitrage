@@ -38,7 +38,7 @@ CONFIG = {
 }
 
 
-async def execute_signal(sig: dict, db: Database, config: dict):
+async def execute_signal(sig: dict, db: Database, config: dict, ws=None):
     """Open a position for an arbitrage signal."""
     open_pos = await db.get_open_positions(config["CONFIG_TAG"])
     if len(open_pos) >= config["MAX_OPEN"]:
@@ -50,6 +50,20 @@ async def execute_signal(sig: dict, db: Database, config: dict):
         if p["market_id"] == sig["market_id"]:
             log.debug(f"[EXEC] skip '{sig['question'][:35]}': already have open position")
             return False
+
+    # Use WS-confirmed price if available (scanner prices can be stale/default)
+    if ws:
+        ws_price = ws.get_price(sig["market_id"])
+        if ws_price > 0:
+            real_price = ws_price if sig["side"] == "YES" else (1 - ws_price)
+            # Reject if signal price diverges >5% from WS price (stale data)
+            if abs(real_price - sig["side_price"]) / sig["side_price"] > 0.05:
+                log.warning(
+                    f"[EXEC] skip '{sig['question'][:35]}': price mismatch "
+                    f"signal={sig['side_price']:.4f} ws={real_price:.4f}")
+                return False
+            # Use WS price as entry (more accurate)
+            sig["side_price"] = round(real_price, 4)
 
     stats = await db.get_stats()
     bankroll = stats.get("bankroll", config["BANKROLL"])
@@ -328,7 +342,7 @@ async def main():
 
                 # Execute max 1 signal per tick — quality over quantity
                 for sig in total_signals[:1]:
-                    executed = await execute_signal(sig, db, CONFIG)
+                    executed = await execute_signal(sig, db, CONFIG, ws=ws)
                     if executed:
                         if sig.get("signal_type") == "mispricing":
                             mispricing.mark_cooldown(sig["market_id"])
