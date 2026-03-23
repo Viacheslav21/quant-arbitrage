@@ -245,6 +245,10 @@ class PolymarketWS:
             return 0
         return entry.get("yes_price", 0)
 
+    def is_confirmed(self, market_id: str) -> bool:
+        """Check if a market has received at least one WS price update."""
+        return self.prices.get(market_id, {}).get("ws_confirmed", False)
+
     def stop(self):
         """Stop the WebSocket client."""
         self._running = False

@@ -339,8 +339,10 @@ async def main():
                     signals = detector.detect(group_name, group_markets, open_market_ids=open_mids)
                     total_signals.extend(signals)
 
-                # Mispricing detection (runs on all markets, not just grouped)
-                mp_signals = mispricing.detect(current_markets, open_market_ids=open_mids)
+                # Mispricing detection — only use WS-confirmed prices to avoid
+                # false violations from stale scanner prices
+                confirmed_markets = [m for m in current_markets if ws.is_confirmed(m["id"])]
+                mp_signals = mispricing.detect(confirmed_markets, open_market_ids=open_mids)
                 total_signals.extend(mp_signals)
 
                 # Sort: mispricing first (structural edge), then by confidence × EV
