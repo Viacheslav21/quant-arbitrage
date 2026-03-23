@@ -51,24 +51,30 @@ async def execute_signal(sig: dict, db: Database, config: dict, ws=None):
             log.debug(f"[EXEC] skip '{sig['question'][:35]}': already have open position")
             return False
 
-    # Require WS-confirmed price — scanner prices are often stale/default
-    if ws:
-        ws_price = ws.get_price(sig["market_id"])
-        if ws_price <= 0:
-            log.debug(f"[EXEC] skip '{sig['question'][:35]}': no WS price yet")
-            return False
-        real_price = ws_price if sig["side"] == "YES" else (1 - ws_price)
-        # Reject if signal price diverges >5% from WS price (stale data)
-        if abs(real_price - sig["side_price"]) / sig["side_price"] > 0.05:
-            log.warning(
-                f"[EXEC] skip '{sig['question'][:35]}': price mismatch "
-                f"signal={sig['side_price']:.4f} ws={real_price:.4f}")
-            return False
-        # Use WS price as entry (more accurate)
-        sig["side_price"] = round(real_price, 4)
-    else:
+    # Require WS-confirmed price with tight spread — reject stale/illiquid
+    if not ws:
         log.debug(f"[EXEC] skip '{sig['question'][:35]}': WS not available")
         return False
+
+    ws_spread = ws.get_spread(sig["market_id"])
+    if ws_spread > 0.04:
+        log.info(f"[EXEC] skip '{sig['question'][:35]}': spread too wide ({ws_spread:.3f})")
+        return False
+
+    # Use bid/ask for entry, not mid (mid=0.50 on thin books is misleading)
+    entry_price = ws.get_entry_price(sig["market_id"], sig["side"])
+    if entry_price <= 0:
+        log.debug(f"[EXEC] skip '{sig['question'][:35]}': no WS price yet")
+        return False
+
+    # Reject if signal price diverges >10% from WS bid/ask price
+    if abs(entry_price - sig["side_price"]) / sig["side_price"] > 0.10:
+        log.info(
+            f"[EXEC] skip '{sig['question'][:35]}': price mismatch "
+            f"signal={sig['side_price']:.4f} ws_entry={entry_price:.4f} spread={ws_spread:.3f}")
+        return False
+
+    sig["side_price"] = round(entry_price, 4)
 
     stats = await db.get_stats()
     bankroll = stats.get("bankroll", config["BANKROLL"])
@@ -220,6 +226,7 @@ async def main():
         """Called by WebSocket on every price update — feed detector and check TP/SL reactively."""
         if market_id in market_map:
             market_map[market_id]["yes_price"] = new_price
+            market_map[market_id]["spread"] = ws.get_spread(market_id)
 
         # Reactive TP/SL check on every price tick
         pos = _open_positions.get(market_id)
@@ -317,11 +324,12 @@ async def main():
             try:
                 tick += 1
 
-                # Update market prices from WebSocket data
+                # Update market prices + spreads from WebSocket data
                 for mid in grouped_ids:
                     ws_price = ws.get_price(mid)
                     if ws_price > 0 and mid in market_map:
                         market_map[mid]["yes_price"] = ws_price
+                        market_map[mid]["spread"] = ws.get_spread(mid)
 
                 # Rebuild markets list with latest prices
                 current_markets = list(market_map.values())

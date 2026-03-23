@@ -249,6 +249,22 @@ class PolymarketWS:
         """Check if a market has received at least one WS price update."""
         return self.prices.get(market_id, {}).get("ws_confirmed", False)
 
+    def get_spread(self, market_id: str) -> float:
+        """Get WS-reported spread for a market."""
+        return self.prices.get(market_id, {}).get("spread", 1.0)
+
+    def get_entry_price(self, market_id: str, side: str) -> float:
+        """Get realistic entry price using bid/ask (not misleading mid).
+        Buying YES → pay the ask. Buying NO → pay 1 - best_bid."""
+        entry = self.prices.get(market_id)
+        if not entry or not entry.get("ws_confirmed"):
+            return 0
+        if side == "YES":
+            return entry.get("best_ask", entry.get("yes_price", 0))
+        else:
+            bid = entry.get("best_bid", 0)
+            return round(1 - bid, 4) if bid > 0 else 0
+
     def stop(self):
         """Stop the WebSocket client."""
         self._running = False
