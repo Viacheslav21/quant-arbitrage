@@ -90,9 +90,10 @@ class Detector:
                 self.stats[mid] = MarketStats()
             self.stats[mid].update(now, m["yes_price"])
 
-    def detect(self, group_name: str, markets: list) -> list:
+    def detect(self, group_name: str, markets: list, open_market_ids: set = None) -> list:
         """Detect leader/lagger divergences using z-scores, correlation, and OU mean-reversion."""
         now = time.time()
+        self._open_market_ids = open_market_ids or set()
 
         if self._tick_count < WARMUP_TICKS:
             log.debug(f"[DETECT] {group_name}: warming up ({self._tick_count}/{WARMUP_TICKS})")
@@ -153,6 +154,9 @@ class Detector:
         log.debug(f"[DETECT] {group_name}: evaluating {candidates} lagger candidates")
         for mid, data in scored.items():
             if mid == leader_mid:
+                continue
+            if mid in self._open_market_ids:
+                log.debug(f"[DETECT] skip '{data['market']['question'][:35]}': open position")
                 continue
             if mid in self._cooldown:
                 log.debug(f"[DETECT] skip '{data['market']['question'][:35]}': cooldown")

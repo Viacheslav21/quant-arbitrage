@@ -147,10 +147,11 @@ class MispricingDetector:
         self._daily_trades: dict[str, int] = {}  # market_id -> count today
         self._daily_reset_day: int = 0
 
-    def detect(self, markets: list) -> list:
+    def detect(self, markets: list, open_market_ids: set = None) -> list:
         """Find monotonicity violations across all markets."""
         now = time.time()
         self._cooldown = {k: v for k, v in self._cooldown.items() if now - v < COOLDOWN_SEC}
+        self._open_market_ids = open_market_ids or set()
 
         # Reset daily trade counts at midnight
         from datetime import datetime, timezone
@@ -235,8 +236,6 @@ class MispricingDetector:
         signals.sort(key=lambda s: s.get("confidence", 0) * s["ev"], reverse=True)
         if signals:
             log.info(f"[MISPRICING] {len(signals)} signal(s) | top: EV={signals[0]['ev']*100:.1f}% conf={signals[0]['confidence']:.2f} '{signals[0]['question'][:40]}'")
-        else:
-            log.debug(f"[MISPRICING] no signals this tick")
         return signals
 
     def _check_strike(self, family: list, now: float) -> list:
@@ -317,7 +316,9 @@ class MispricingDetector:
         # Buy YES on underpriced
         mid = underpriced["id"]
         daily_count = self._daily_trades.get(mid, 0)
-        if mid in self._cooldown:
+        if mid in self._open_market_ids:
+            log.debug(f"[MISPRICING] skip YES '{underpriced['question'][:35]}': open position")
+        elif mid in self._cooldown:
             log.debug(f"[MISPRICING] skip YES '{underpriced['question'][:35]}': cooldown")
         elif daily_count >= MAX_DAILY_TRADES:
             log.debug(f"[MISPRICING] skip YES '{underpriced['question'][:35]}': daily cap ({daily_count}/{MAX_DAILY_TRADES})")
@@ -334,7 +335,9 @@ class MispricingDetector:
         # Buy NO on overpriced
         mid = overpriced["id"]
         daily_count = self._daily_trades.get(mid, 0)
-        if mid in self._cooldown:
+        if mid in self._open_market_ids:
+            log.debug(f"[MISPRICING] skip NO '{overpriced['question'][:35]}': open position")
+        elif mid in self._cooldown:
             log.debug(f"[MISPRICING] skip NO '{overpriced['question'][:35]}': cooldown")
         elif daily_count >= MAX_DAILY_TRADES:
             log.debug(f"[MISPRICING] skip NO '{overpriced['question'][:35]}': daily cap ({daily_count}/{MAX_DAILY_TRADES})")

@@ -51,19 +51,24 @@ async def execute_signal(sig: dict, db: Database, config: dict, ws=None):
             log.debug(f"[EXEC] skip '{sig['question'][:35]}': already have open position")
             return False
 
-    # Use WS-confirmed price if available (scanner prices can be stale/default)
+    # Require WS-confirmed price — scanner prices are often stale/default
     if ws:
         ws_price = ws.get_price(sig["market_id"])
-        if ws_price > 0:
-            real_price = ws_price if sig["side"] == "YES" else (1 - ws_price)
-            # Reject if signal price diverges >5% from WS price (stale data)
-            if abs(real_price - sig["side_price"]) / sig["side_price"] > 0.05:
-                log.warning(
-                    f"[EXEC] skip '{sig['question'][:35]}': price mismatch "
-                    f"signal={sig['side_price']:.4f} ws={real_price:.4f}")
-                return False
-            # Use WS price as entry (more accurate)
-            sig["side_price"] = round(real_price, 4)
+        if ws_price <= 0:
+            log.debug(f"[EXEC] skip '{sig['question'][:35]}': no WS price yet")
+            return False
+        real_price = ws_price if sig["side"] == "YES" else (1 - ws_price)
+        # Reject if signal price diverges >5% from WS price (stale data)
+        if abs(real_price - sig["side_price"]) / sig["side_price"] > 0.05:
+            log.warning(
+                f"[EXEC] skip '{sig['question'][:35]}': price mismatch "
+                f"signal={sig['side_price']:.4f} ws={real_price:.4f}")
+            return False
+        # Use WS price as entry (more accurate)
+        sig["side_price"] = round(real_price, 4)
+    else:
+        log.debug(f"[EXEC] skip '{sig['question'][:35]}': WS not available")
+        return False
 
     stats = await db.get_stats()
     bankroll = stats.get("bankroll", config["BANKROLL"])
@@ -169,8 +174,9 @@ async def monitor_positions(db: Database, scanner: PolymarketScanner,
         if not close_reason:
             continue
 
-        # PnL based on real market price (like a real trade)
-        payout = round(pos["stake_amt"] * (1 + pnl_pct), 2)
+        # Cap PnL at TP% for TAKE_PROFIT to avoid phantom gains from stale entry prices
+        capped_pct = min(pnl_pct, config["TP_PCT"]) if close_reason == "TAKE_PROFIT" else pnl_pct
+        payout = round(pos["stake_amt"] * (1 + capped_pct), 2)
         pnl = round(payout - pos["stake_amt"], 2)
         result = "WIN" if pnl > 0 else "LOSS"
 
@@ -186,7 +192,8 @@ async def monitor_positions(db: Database, scanner: PolymarketScanner,
         if pos.get("opened_at"):
             age_m = (datetime.now(timezone.utc) - pos["opened_at"]).total_seconds() / 60
             age_str = f" age:{age_m:.0f}m"
-        log.info(f"[CLOSE] {emoji} {close_reason} '{pos['question'][:40]}' PnL:{pnl:+.2f} entry:{pos['side_price']:.4f}→{price:.4f} ({pnl_pct*100:+.1f}%){age_str}")
+        cap_note = f" [capped from {pnl_pct*100:+.1f}%]" if close_reason == "TAKE_PROFIT" and pnl_pct > config["TP_PCT"] * 1.01 else ""
+        log.info(f"[CLOSE] {emoji} {close_reason} '{pos['question'][:40]}' PnL:{pnl:+.2f} entry:{pos['side_price']:.4f}→{price:.4f} ({capped_pct*100:+.1f}%){cap_note}{age_str}")
 
 
 async def main():
@@ -232,7 +239,9 @@ async def main():
             return
 
         _closing_ids.add(pos["id"])
-        payout = round(pos["stake_amt"] * (1 + pnl_pct), 2)
+        # Cap PnL at TP% for TAKE_PROFIT to avoid phantom gains
+        capped_pct = min(pnl_pct, CONFIG["TP_PCT"]) if close_reason == "TAKE_PROFIT" else pnl_pct
+        payout = round(pos["stake_amt"] * (1 + capped_pct), 2)
         pnl = round(payout - pos["stake_amt"], 2)
         result = "WIN" if pnl > 0 else "LOSS"
 
@@ -247,7 +256,8 @@ async def main():
         if pos.get("opened_at"):
             age_m = (datetime.now(timezone.utc) - pos["opened_at"]).total_seconds() / 60
             age_str = f" age:{age_m:.0f}m"
-        log.info(f"[CLOSE] {emoji} {close_reason} '{pos['question'][:40]}' PnL:{pnl:+.2f} entry:{pos['side_price']:.4f}→{price:.4f} ({pnl_pct*100:+.1f}%){age_str}")
+        cap_note = f" [capped from {pnl_pct*100:+.1f}%]" if close_reason == "TAKE_PROFIT" and pnl_pct > CONFIG["TP_PCT"] * 1.01 else ""
+        log.info(f"[CLOSE] {emoji} {close_reason} '{pos['question'][:40]}' PnL:{pnl:+.2f} entry:{pos['side_price']:.4f}→{price:.4f} ({capped_pct*100:+.1f}%){cap_note}{age_str}")
 
     async def on_trade(market_id, price, size, side):
         """Called on every trade — log whale trades."""
@@ -317,16 +327,20 @@ async def main():
                 current_markets = list(market_map.values())
                 groups = assign(current_markets)
 
+                # Collect open market IDs to skip in detection
+                open_pos = await db.get_open_positions(CONFIG["CONFIG_TAG"])
+                open_mids = {p["market_id"] for p in open_pos}
+
                 # Feed prices and detect signals
                 detector._tick_count += 1
                 total_signals = []
                 for group_name, group_markets in groups.items():
                     detector.update(group_markets)
-                    signals = detector.detect(group_name, group_markets)
+                    signals = detector.detect(group_name, group_markets, open_market_ids=open_mids)
                     total_signals.extend(signals)
 
                 # Mispricing detection (runs on all markets, not just grouped)
-                mp_signals = mispricing.detect(current_markets)
+                mp_signals = mispricing.detect(current_markets, open_market_ids=open_mids)
                 total_signals.extend(mp_signals)
 
                 # Sort: mispricing first (structural edge), then by confidence × EV
