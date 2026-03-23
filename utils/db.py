@@ -70,12 +70,15 @@ class Database:
             """)
             # Migrations
             await conn.execute("ALTER TABLE arb_signals ADD COLUMN IF NOT EXISTS signal_type TEXT DEFAULT 'leader_lagger'")
-            # Ensure stats row exists
+            # Clean slate on startup
+            await conn.execute("DELETE FROM arb_positions")
+            await conn.execute("DELETE FROM arb_signals")
+            await conn.execute("DELETE FROM arb_stats")
             await conn.execute("""
-                INSERT INTO arb_stats (id, bankroll) VALUES (1, $1)
-                ON CONFLICT (id) DO NOTHING
+                INSERT INTO arb_stats (id, bankroll, total_pnl, total_bets, wins, losses)
+                VALUES (1, $1, 0, 0, 0, 0)
             """, self.starting_bankroll)
-        log.info("[DB] Connected, arb tables ready")
+        log.info(f"[DB] Connected, clean slate — bankroll ${self.starting_bankroll:.0f}")
 
     # ── Signals ──
 
@@ -117,13 +120,20 @@ class Database:
                 price, upnl, pos_id)
 
     async def close_position(self, pos_id: str, result: str, pnl: float, payout: float,
-                              reason: str, outcome: str = ""):
+                              reason: str, exit_price: float = None, outcome: str = ""):
         async with self.pool.acquire() as conn:
-            await conn.execute("""
-                UPDATE arb_positions SET status='closed', result=$1, pnl=$2, payout=$3,
-                    close_reason=$4, closed_at=NOW()
-                WHERE id=$5
-            """, result, pnl, payout, reason, pos_id)
+            if exit_price is not None:
+                await conn.execute("""
+                    UPDATE arb_positions SET status='closed', result=$1, pnl=$2, payout=$3,
+                        close_reason=$4, current_price=$5, closed_at=NOW()
+                    WHERE id=$6
+                """, result, pnl, payout, reason, exit_price, pos_id)
+            else:
+                await conn.execute("""
+                    UPDATE arb_positions SET status='closed', result=$1, pnl=$2, payout=$3,
+                        close_reason=$4, closed_at=NOW()
+                    WHERE id=$5
+                """, result, pnl, payout, reason, pos_id)
 
     # ── Stats (own table) ──
 

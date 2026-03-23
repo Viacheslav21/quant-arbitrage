@@ -138,9 +138,8 @@ async def monitor_positions(db: Database, scanner: PolymarketScanner,
         pnl_pct = (price - pos["side_price"]) / pos["side_price"]
         close_reason = None
 
-        # Take profit — cap at TP to avoid phantom gains from stale prices
+        # Take profit
         if pnl_pct >= config["TP_PCT"]:
-            pnl_pct = config["TP_PCT"]
             close_reason = "TAKE_PROFIT"
 
         # Stop loss
@@ -156,11 +155,12 @@ async def monitor_positions(db: Database, scanner: PolymarketScanner,
         if not close_reason:
             continue
 
+        # PnL based on real market price (like a real trade)
         payout = round(pos["stake_amt"] * (1 + pnl_pct), 2)
         pnl = round(payout - pos["stake_amt"], 2)
         result = "WIN" if pnl > 0 else "LOSS"
 
-        await db.close_position(pos["id"], result, pnl, payout, close_reason)
+        await db.close_position(pos["id"], result, pnl, payout, close_reason, exit_price=price)
         await db.update_bankroll(pnl, result)
 
         # Remove from cache since it's now closed
@@ -210,7 +210,6 @@ async def main():
 
         close_reason = None
         if pnl_pct >= CONFIG["TP_PCT"]:
-            pnl_pct = CONFIG["TP_PCT"]
             close_reason = "TAKE_PROFIT"
         elif pnl_pct <= -CONFIG["SL_PCT"]:
             close_reason = "STOP_LOSS"
@@ -223,7 +222,7 @@ async def main():
         pnl = round(payout - pos["stake_amt"], 2)
         result = "WIN" if pnl > 0 else "LOSS"
 
-        await db.close_position(pos["id"], result, pnl, payout, close_reason)
+        await db.close_position(pos["id"], result, pnl, payout, close_reason, exit_price=price)
         await db.update_bankroll(pnl, result)
 
         _open_positions.pop(market_id, None)
@@ -274,20 +273,116 @@ async def main():
     # Start WebSocket in background
     ws_task = asyncio.create_task(ws.connect())
 
-    tick = 0
-    RESCAN_EVERY = 150  # full rescan every ~10 min (150 × 4s)
+    # ── Task 1: Fast position monitor (every 1s) ────────────────────
+    async def monitor_loop():
+        """High-frequency TP/SL/timeout check — runs independently of detection."""
+        while True:
+            try:
+                current_markets = list(market_map.values())
+                await monitor_positions(db, scanner, CONFIG, current_markets,
+                                        pos_cache=_open_positions, closing_ids=_closing_ids)
+            except Exception as e:
+                log.error(f"[MONITOR] {e}", exc_info=True)
+            await asyncio.sleep(1)
 
-    while True:
-        try:
-            tick += 1
-            now = time.time()
+    # ── Task 2: Detection + execution (every SCAN_INTERVAL) ─────────
+    async def detect_loop():
+        """Signal detection and trade execution."""
+        tick = 0
+        while True:
+            try:
+                tick += 1
 
-            # Periodic full rescan to discover new markets
-            if tick % RESCAN_EVERY == 0:
+                # Update market prices from WebSocket data
+                for mid in grouped_ids:
+                    ws_price = ws.get_price(mid)
+                    if ws_price > 0 and mid in market_map:
+                        market_map[mid]["yes_price"] = ws_price
+
+                # Rebuild markets list with latest prices
+                current_markets = list(market_map.values())
+                groups = assign(current_markets)
+
+                # Feed prices and detect signals
+                detector._tick_count += 1
+                total_signals = []
+                for group_name, group_markets in groups.items():
+                    detector.update(group_markets)
+                    signals = detector.detect(group_name, group_markets)
+                    total_signals.extend(signals)
+
+                # Mispricing detection (runs on all markets, not just grouped)
+                mp_signals = mispricing.detect(current_markets)
+                total_signals.extend(mp_signals)
+
+                # Sort: mispricing first (structural edge), then by confidence × EV
+                total_signals.sort(
+                    key=lambda s: (s.get("signal_type") == "mispricing", s.get("confidence", 0) * s["ev"]),
+                    reverse=True,
+                )
+
+                mp_count = sum(1 for s in total_signals if s.get("signal_type") == "mispricing")
+                ll_count = len(total_signals) - mp_count
+                if total_signals:
+                    log.debug(f"[SIGNALS] {len(total_signals)} total ({mp_count} mispricing, {ll_count} leader/lagger)")
+
+                # Execute max 1 signal per tick — quality over quantity
+                for sig in total_signals[:1]:
+                    executed = await execute_signal(sig, db, CONFIG)
+                    if executed:
+                        if sig.get("signal_type") == "mispricing":
+                            mispricing.mark_cooldown(sig["market_id"])
+                        else:
+                            detector.mark_cooldown(sig["market_id"], sig.get("group"))
+
+                # Stats logging every 60 ticks (~4 min)
+                if tick % 60 == 0:
+                    open_pos = await db.get_open_positions(CONFIG["CONFIG_TAG"])
+                    ws_active = len([1 for p in ws.prices.values() if time.time() - p.get("last_update", 0) < 30])
+                    stats = await db.get_stats()
+                    bankroll = stats.get("bankroll", CONFIG["BANKROLL"])
+                    total_pnl = stats.get("total_pnl", 0)
+                    wins = stats.get("wins", 0)
+                    losses = stats.get("losses", 0)
+                    total_bets = stats.get("total_bets", 0)
+                    wr = f"{wins/(wins+losses)*100:.0f}%" if (wins+losses) > 0 else "n/a"
+                    upnl = sum(p.get("unrealized_pnl", 0) for p in open_pos)
+                    ready_stats = sum(1 for s in detector.stats.values() if s.ready)
+                    log.info(
+                        f"[TICK #{tick}] {len(groups)} groups | {ws_active} WS live | "
+                        f"{len(open_pos)} open (uPnL:{upnl:+.2f}) | "
+                        f"bankroll:${bankroll:.2f} PnL:${total_pnl:+.2f} | "
+                        f"W/L:{wins}/{losses} ({wr}) bets:{total_bets} | "
+                        f"stats ready:{ready_stats}/{len(detector.stats)}"
+                    )
+                    # Log individual open positions
+                    for p in open_pos:
+                        age_m = 0
+                        if p.get("opened_at"):
+                            age_m = (datetime.now(timezone.utc) - p["opened_at"]).total_seconds() / 60
+                        log.info(
+                            f"  📊 {p['side']} '{p['question'][:40]}' "
+                            f"entry:{p['side_price']:.4f} now:{p.get('current_price',0):.4f} "
+                            f"uPnL:{p.get('unrealized_pnl',0):+.2f} age:{age_m:.0f}m"
+                        )
+
+            except Exception as e:
+                log.error(f"[DETECT] {e}", exc_info=True)
+
+            await asyncio.sleep(CONFIG["SCAN_INTERVAL"])
+
+    # ── Task 3: Market rescan (every ~10 min) ───────────────────────
+    async def rescan_loop():
+        """Periodic full market rescan to discover new markets."""
+        rescan_interval = CONFIG["SCAN_INTERVAL"] * 150  # ~10 min
+        while True:
+            await asyncio.sleep(rescan_interval)
+            try:
                 new_markets = await scanner.fetch()
                 if new_markets:
-                    markets = new_markets
-                    market_map = {m["id"]: m for m in markets}
+                    markets[:] = new_markets
+                    market_map.clear()
+                    market_map.update({m["id"]: m for m in markets})
                     groups = assign(markets)
                     new_grouped = []
                     for gm in groups.values():
@@ -303,88 +398,16 @@ async def main():
                         )
                         log.info(f"[RESCAN] +{len(new_grouped)} new markets added to WS")
                     log.info(f"[RESCAN] {len(markets)} markets, {len(grouped_ids)} in {len(groups)} groups")
+            except Exception as e:
+                log.error(f"[RESCAN] {e}", exc_info=True)
 
-            # Update market prices from WebSocket data
-            for mid in grouped_ids:
-                ws_price = ws.get_price(mid)
-                if ws_price > 0 and mid in market_map:
-                    market_map[mid]["yes_price"] = ws_price
-
-            # Rebuild markets list with latest prices
-            current_markets = list(market_map.values())
-            groups = assign(current_markets)
-
-            # Feed prices and detect signals
-            detector._tick_count += 1
-            total_signals = []
-            for group_name, group_markets in groups.items():
-                detector.update(group_markets)
-                signals = detector.detect(group_name, group_markets)
-                total_signals.extend(signals)
-
-            # Mispricing detection (runs on all markets, not just grouped)
-            mp_signals = mispricing.detect(current_markets)
-            total_signals.extend(mp_signals)
-
-            # Sort: mispricing first (structural edge), then by confidence × EV
-            total_signals.sort(
-                key=lambda s: (s.get("signal_type") == "mispricing", s.get("confidence", 0) * s["ev"]),
-                reverse=True,
-            )
-
-            mp_count = sum(1 for s in total_signals if s.get("signal_type") == "mispricing")
-            ll_count = len(total_signals) - mp_count
-            if total_signals:
-                log.debug(f"[SIGNALS] {len(total_signals)} total ({mp_count} mispricing, {ll_count} leader/lagger)")
-
-            # Execute max 1 signal per tick — quality over quantity
-            for sig in total_signals[:1]:
-                executed = await execute_signal(sig, db, CONFIG)
-                if executed:
-                    if sig.get("signal_type") == "mispricing":
-                        mispricing.mark_cooldown(sig["market_id"])
-                    else:
-                        detector.mark_cooldown(sig["market_id"], sig.get("group"))
-
-            # Monitor open positions (use WS prices) + sync cache for reactive WS TP/SL
-            await monitor_positions(db, scanner, CONFIG, current_markets,
-                                    pos_cache=_open_positions, closing_ids=_closing_ids)
-
-            # Stats logging every 60 ticks (~4 min)
-            if tick % 60 == 0:
-                open_pos = await db.get_open_positions(CONFIG["CONFIG_TAG"])
-                ws_active = len([1 for p in ws.prices.values() if time.time() - p.get("last_update", 0) < 30])
-                stats = await db.get_stats()
-                bankroll = stats.get("bankroll", CONFIG["BANKROLL"])
-                total_pnl = stats.get("total_pnl", 0)
-                wins = stats.get("wins", 0)
-                losses = stats.get("losses", 0)
-                total_bets = stats.get("total_bets", 0)
-                wr = f"{wins/(wins+losses)*100:.0f}%" if (wins+losses) > 0 else "n/a"
-                upnl = sum(p.get("unrealized_pnl", 0) for p in open_pos)
-                ready_stats = sum(1 for s in detector.stats.values() if s.ready)
-                log.info(
-                    f"[TICK #{tick}] {len(groups)} groups | {ws_active} WS live | "
-                    f"{len(open_pos)} open (uPnL:{upnl:+.2f}) | "
-                    f"bankroll:${bankroll:.2f} PnL:${total_pnl:+.2f} | "
-                    f"W/L:{wins}/{losses} ({wr}) bets:{total_bets} | "
-                    f"stats ready:{ready_stats}/{len(detector.stats)}"
-                )
-                # Log individual open positions
-                for p in open_pos:
-                    age_m = 0
-                    if p.get("opened_at"):
-                        age_m = (datetime.now(timezone.utc) - p["opened_at"]).total_seconds() / 60
-                    log.info(
-                        f"  📊 {p['side']} '{p['question'][:40]}' "
-                        f"entry:{p['side_price']:.4f} now:{p.get('current_price',0):.4f} "
-                        f"uPnL:{p.get('unrealized_pnl',0):+.2f} age:{age_m:.0f}m"
-                    )
-
-        except Exception as e:
-            log.error(f"[MAIN] {e}", exc_info=True)
-
-        await asyncio.sleep(CONFIG["SCAN_INTERVAL"])
+    # Launch all tasks concurrently
+    await asyncio.gather(
+        ws_task,
+        monitor_loop(),
+        detect_loop(),
+        rescan_loop(),
+    )
 
 
 async def _shutdown(db, scanner, ws=None):
