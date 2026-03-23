@@ -102,9 +102,20 @@ async def execute_signal(sig: dict, db: Database, config: dict):
 
 
 async def monitor_positions(db: Database, scanner: PolymarketScanner,
-                             config: dict, markets: list):
-    """Monitor open arb positions for TP/SL/timeout."""
+                             config: dict, markets: list,
+                             pos_cache: dict = None, closing_ids: set = None):
+    """Monitor open arb positions for TP/SL/timeout.
+    Also syncs pos_cache for reactive WS-based TP/SL checks."""
     open_pos = await db.get_open_positions(config["CONFIG_TAG"])
+
+    # Sync local position cache for reactive WS TP/SL
+    if pos_cache is not None:
+        pos_cache.clear()
+        for p in open_pos:
+            if closing_ids and p["id"] in closing_ids:
+                continue
+            pos_cache[p["market_id"]] = p
+
     if not open_pos:
         return
 
@@ -112,6 +123,10 @@ async def monitor_positions(db: Database, scanner: PolymarketScanner,
     now = time.time()
 
     for pos in open_pos:
+        # Skip if already closed by reactive WS callback
+        if closing_ids and pos["id"] in closing_ids:
+            continue
+
         m = market_map.get(pos["market_id"])
         if not m:
             continue
@@ -148,6 +163,10 @@ async def monitor_positions(db: Database, scanner: PolymarketScanner,
         await db.close_position(pos["id"], result, pnl, payout, close_reason)
         await db.update_bankroll(pnl, result)
 
+        # Remove from cache since it's now closed
+        if pos_cache is not None:
+            pos_cache.pop(pos["market_id"], None)
+
         emoji = "✅" if result == "WIN" else "❌"
         age_str = ""
         if pos.get("opened_at"):
@@ -173,11 +192,49 @@ async def main():
 
     # Shared state between WS callbacks and main loop
     _pending_signals = []
+    _open_positions = {}   # market_id -> position dict (local cache for reactive TP/SL)
+    _closing_ids = set()   # position IDs being closed (prevent double-close)
 
     async def on_price_change(market_id, old_price, new_price):
-        """Called by WebSocket on every price update — feed detector in real time."""
+        """Called by WebSocket on every price update — feed detector and check TP/SL reactively."""
         if market_id in market_map:
             market_map[market_id]["yes_price"] = new_price
+
+        # Reactive TP/SL check on every price tick
+        pos = _open_positions.get(market_id)
+        if not pos or pos["id"] in _closing_ids:
+            return
+
+        price = new_price if pos["side"] == "YES" else (1 - new_price)
+        pnl_pct = (price - pos["side_price"]) / pos["side_price"]
+
+        close_reason = None
+        if pnl_pct >= CONFIG["TP_PCT"]:
+            pnl_pct = CONFIG["TP_PCT"]
+            close_reason = "TAKE_PROFIT"
+        elif pnl_pct <= -CONFIG["SL_PCT"]:
+            close_reason = "STOP_LOSS"
+
+        if not close_reason:
+            return
+
+        _closing_ids.add(pos["id"])
+        payout = round(pos["stake_amt"] * (1 + pnl_pct), 2)
+        pnl = round(payout - pos["stake_amt"], 2)
+        result = "WIN" if pnl > 0 else "LOSS"
+
+        await db.close_position(pos["id"], result, pnl, payout, close_reason)
+        await db.update_bankroll(pnl, result)
+
+        _open_positions.pop(market_id, None)
+        _closing_ids.discard(pos["id"])
+
+        emoji = "✅" if result == "WIN" else "❌"
+        age_str = ""
+        if pos.get("opened_at"):
+            age_m = (datetime.now(timezone.utc) - pos["opened_at"]).total_seconds() / 60
+            age_str = f" age:{age_m:.0f}m"
+        log.info(f"[CLOSE] {emoji} {close_reason} '{pos['question'][:40]}' PnL:{pnl:+.2f} entry:{pos['side_price']:.4f}→{price:.4f} ({pnl_pct*100:+.1f}%){age_str}")
 
     async def on_trade(market_id, price, size, side):
         """Called on every trade — log whale trades."""
@@ -289,8 +346,9 @@ async def main():
                     else:
                         detector.mark_cooldown(sig["market_id"], sig.get("group"))
 
-            # Monitor open positions (use WS prices)
-            await monitor_positions(db, scanner, CONFIG, current_markets)
+            # Monitor open positions (use WS prices) + sync cache for reactive WS TP/SL
+            await monitor_positions(db, scanner, CONFIG, current_markets,
+                                    pos_cache=_open_positions, closing_ids=_closing_ids)
 
             # Stats logging every 60 ticks (~4 min)
             if tick % 60 == 0:
