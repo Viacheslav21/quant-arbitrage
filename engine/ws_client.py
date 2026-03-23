@@ -52,7 +52,8 @@ class PolymarketWS:
                     "question": m.get("question", ""),
                     "yes_token": yes_token,
                     "no_token": no_token,
-                    "last_update": time.time(),
+                    "last_update": 0,
+                    "ws_confirmed": False,
                 }
             else:
                 # Update token IDs if missing
@@ -184,6 +185,7 @@ class PolymarketWS:
                 self.prices[market_id]["best_ask"] = float(best_ask) if is_yes else round(1 - float(best_bid), 4)
                 self.prices[market_id]["spread"] = spread
                 self.prices[market_id]["last_update"] = time.time()
+                self.prices[market_id]["ws_confirmed"] = True
 
                 if self._on_price_change:
                     await self._on_price_change(market_id, old_price, yes_price)
@@ -208,6 +210,7 @@ class PolymarketWS:
             self.prices[market_id]["last_trade_size"] = size
             self.prices[market_id]["last_trade_side"] = side
             self.prices[market_id]["last_update"] = time.time()
+            self.prices[market_id]["ws_confirmed"] = True
 
         if self._on_trade and size > 0:
             await self._on_trade(market_id, price, size, side)
@@ -233,10 +236,14 @@ class PolymarketWS:
                 self.prices[market_id]["best_ask"] = best_ask if is_yes else round(1 - best_bid, 4)
                 self.prices[market_id]["spread"] = spread
                 self.prices[market_id]["last_update"] = time.time()
+                self.prices[market_id]["ws_confirmed"] = True
 
     def get_price(self, market_id: str) -> float:
-        """Get latest price for a market."""
-        return self.prices.get(market_id, {}).get("yes_price", 0)
+        """Get latest WS-confirmed price for a market. Returns 0 if not yet confirmed by WS."""
+        entry = self.prices.get(market_id)
+        if not entry or not entry.get("ws_confirmed"):
+            return 0
+        return entry.get("yes_price", 0)
 
     def stop(self):
         """Stop the WebSocket client."""
