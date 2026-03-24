@@ -263,17 +263,22 @@ async def main():
             return
 
         _closing_ids.add(pos["id"])
-        # Cap PnL at TP% for TAKE_PROFIT to avoid phantom gains
-        capped_pct = min(pnl_pct, CONFIG["TP_PCT"]) if close_reason == "TAKE_PROFIT" else pnl_pct
-        payout = round(pos["stake_amt"] * (1 + capped_pct), 2)
-        pnl = round(payout - pos["stake_amt"], 2)
-        result = "WIN" if pnl > 0 else "LOSS"
+        try:
+            # Cap PnL at TP% for TAKE_PROFIT to avoid phantom gains
+            capped_pct = min(pnl_pct, CONFIG["TP_PCT"]) if close_reason == "TAKE_PROFIT" else pnl_pct
+            payout = round(pos["stake_amt"] * (1 + capped_pct), 2)
+            pnl = round(payout - pos["stake_amt"], 2)
+            result = "WIN" if pnl > 0 else "LOSS"
 
-        await db.close_position(pos["id"], result, pnl, payout, close_reason, exit_price=price)
-        await db.update_bankroll(pnl, result)
+            await db.close_position(pos["id"], result, pnl, payout, close_reason, exit_price=price)
+            await db.update_bankroll(pnl, result)
 
-        _open_positions.pop(market_id, None)
-        _closing_ids.discard(pos["id"])
+            _open_positions.pop(market_id, None)
+        except Exception as e:
+            log.error(f"[WS-CLOSE] DB failed for '{pos['question'][:35]}': {e}, releasing lock for retry")
+            return
+        finally:
+            _closing_ids.discard(pos["id"])
 
         emoji = "✅" if result == "WIN" else "❌"
         age_str = ""

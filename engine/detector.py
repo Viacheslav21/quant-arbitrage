@@ -15,11 +15,11 @@ GROUP_COOLDOWN = 600      # 10 min per-group cooldown
 MAX_GROUP_SIZE = 15       # cap markets per group (top by liquidity)
 
 # ── Statistical thresholds ──
-LEADER_Z_THRESHOLD = 2.0  # leader must move ≥ 2σ (2-sigma = statistically significant)
-LAGGER_Z_THRESHOLD = 0.5  # lagger must be quiet (not already moving)
-MIN_CORRELATION = 0.40    # minimum Pearson ρ (need meaningful correlation)
+LEADER_Z_THRESHOLD = 1.8  # leader must move ≥ 1.8σ
+LAGGER_Z_THRESHOLD = 0.6  # lagger must be relatively quiet
+MIN_CORRELATION = 0.35    # minimum Pearson ρ
 MIN_VOLATILITY = 0.001    # skip markets with near-zero vol
-MIN_HL_TICKS = 30         # minimum OU half-life (~2 min) — below this is numerical noise
+MIN_HL_TICKS = 20         # minimum OU half-life (~80s) — below this is numerical noise
 
 # ── Price / spread filters ──
 MIN_PRICE = 0.10
