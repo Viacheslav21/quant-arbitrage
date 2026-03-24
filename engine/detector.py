@@ -145,7 +145,10 @@ class Detector:
                     leader_mid = mid
 
         if not leader:
-            log.debug(f"[DETECT] {group_name}: no leader found (max |z|={max((d['abs_z'] for d in scored.values()), default=0):.2f}, need {LEADER_Z_THRESHOLD})")
+            max_z = max((d['abs_z'] for d in scored.values()), default=0)
+            # Log max z every 300 ticks (~20 min) to diagnose filter tightness
+            if self._tick_count % 300 == 0:
+                log.info(f"[DETECT] {group_name}: no leader (max |z|={max_z:.2f}, need {LEADER_Z_THRESHOLD}) {len(scored)} markets")
             return []
 
         log.debug(f"[DETECT] {group_name}: leader '{leader['market']['question'][:40]}' z={leader['z']:.2f}")
@@ -261,6 +264,8 @@ class Detector:
         signals.sort(key=lambda s: s["confidence"] * s["ev"], reverse=True)
         if signals:
             log.info(f"[DETECT] {group_name}: {len(signals)} leader/lagger signal(s) found")
+        elif leader:
+            log.info(f"[DETECT] {group_name}: leader found (z={leader['z']:.2f}) but 0 laggers passed filters")
         return signals
 
     def mark_cooldown(self, market_id: str, group_name: str = None):
