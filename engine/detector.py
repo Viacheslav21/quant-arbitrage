@@ -15,10 +15,11 @@ GROUP_COOLDOWN = 600      # 10 min per-group cooldown
 MAX_GROUP_SIZE = 15       # cap markets per group (top by liquidity)
 
 # ── Statistical thresholds ──
-LEADER_Z_THRESHOLD = 1.5  # leader must move ≥ 1.5σ (relaxed from 2.0 — prediction markets move slowly)
-LAGGER_Z_THRESHOLD = 0.7  # lagger must be relatively quiet (relaxed from 0.5)
-MIN_CORRELATION = 0.25    # minimum Pearson ρ (relaxed from 0.35 — prediction markets are weakly correlated)
-MIN_VOLATILITY = 0.0005   # skip markets with near-zero vol (relaxed from 0.001)
+LEADER_Z_THRESHOLD = 2.0  # leader must move ≥ 2σ (2-sigma = statistically significant)
+LAGGER_Z_THRESHOLD = 0.5  # lagger must be quiet (not already moving)
+MIN_CORRELATION = 0.40    # minimum Pearson ρ (need meaningful correlation)
+MIN_VOLATILITY = 0.001    # skip markets with near-zero vol
+MIN_HL_TICKS = 30         # minimum OU half-life (~2 min) — below this is numerical noise
 
 # ── Price / spread filters ──
 MIN_PRICE = 0.10
@@ -65,11 +66,11 @@ class MarketStats:
         return self.prices[-1][1] - self.prices[-lookback][1]
 
     def z_score(self, lookback: int = LOOKBACK_TICKS) -> float:
-        """Z-score of recent move: move / σ."""
+        """Z-score of recent move: move / (σ × √lookback)."""
         vol = self.volatility
         if vol < MIN_VOLATILITY:
             return 0.0
-        return self.recent_move(lookback) / vol
+        return self.recent_move(lookback) / (vol * math.sqrt(lookback))
 
 
 class Detector:
@@ -105,6 +106,7 @@ class Detector:
 
         # Expire old cooldowns
         self._cooldown = {k: v for k, v in self._cooldown.items() if now - v < COOLDOWN}
+        self._group_cooldown = {k: v for k, v in self._group_cooldown.items() if now - v < GROUP_COOLDOWN}
 
         # Cap group size — keep most liquid
         if len(markets) > MAX_GROUP_SIZE:
@@ -184,8 +186,11 @@ class Detector:
                 log.debug(f"[DETECT] skip '{q_short}': |ρ|={abs(eff_corr):.3f} < {MIN_CORRELATION}")
                 continue
 
-            # ── OU half-life — skip if too slow to converge ──
+            # ── OU half-life — skip if too fast (noise) or too slow to converge ──
             hl_ticks = self._ou_half_life(leader_mid, mid)
+            if hl_ticks < MIN_HL_TICKS:
+                log.debug(f"[DETECT] skip '{q_short}': OU HL={hl_ticks:.0f} ticks < min {MIN_HL_TICKS} (noise)")
+                continue
             timeout_ticks = 30 * 60 / 4  # 450 ticks = 30 min
             if hl_ticks > timeout_ticks:
                 log.debug(f"[DETECT] skip '{q_short}': OU HL={hl_ticks:.0f} ticks > timeout {timeout_ticks:.0f}")

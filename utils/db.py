@@ -70,15 +70,21 @@ class Database:
             """)
             # Migrations
             await conn.execute("ALTER TABLE arb_signals ADD COLUMN IF NOT EXISTS signal_type TEXT DEFAULT 'leader_lagger'")
-            # Clean slate on startup
-            await conn.execute("DELETE FROM arb_positions")
-            await conn.execute("DELETE FROM arb_signals")
-            await conn.execute("DELETE FROM arb_stats")
+            # Close any positions left open from previous run (unclean shutdown)
             await conn.execute("""
-                INSERT INTO arb_stats (id, bankroll, total_pnl, total_bets, wins, losses)
-                VALUES (1, $1, 0, 0, 0, 0)
-            """, self.starting_bankroll)
-        log.info(f"[DB] Connected, clean slate — bankroll ${self.starting_bankroll:.0f}")
+                UPDATE arb_positions SET status='closed', close_reason='RESTART', result='LOSS', pnl=0
+                WHERE status='open'
+            """)
+            # Initialize stats if not exists (preserve across restarts)
+            existing = await conn.fetchval("SELECT id FROM arb_stats WHERE id=1")
+            if not existing:
+                await conn.execute("""
+                    INSERT INTO arb_stats (id, bankroll, total_pnl, total_bets, wins, losses)
+                    VALUES (1, $1, 0, 0, 0, 0)
+                """, self.starting_bankroll)
+        stats = await self.get_stats()
+        log.info(f"[DB] Connected — bankroll ${stats.get('bankroll', self.starting_bankroll):.2f} "
+                 f"PnL:${stats.get('total_pnl', 0):+.2f} W/L:{stats.get('wins',0)}/{stats.get('losses',0)}")
 
     # ── Signals ──
 

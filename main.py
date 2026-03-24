@@ -128,7 +128,8 @@ async def execute_signal(sig: dict, db: Database, config: dict, ws=None):
 
 async def monitor_positions(db: Database, scanner: PolymarketScanner,
                              config: dict, markets: list,
-                             pos_cache: dict = None, closing_ids: set = None):
+                             pos_cache: dict = None, closing_ids: set = None,
+                             ws: PolymarketWS = None):
     """Monitor open arb positions for TP/SL/timeout.
     Also syncs pos_cache for reactive WS-based TP/SL checks."""
     open_pos = await db.get_open_positions(config["CONFIG_TAG"])
@@ -156,12 +157,22 @@ async def monitor_positions(db: Database, scanner: PolymarketScanner,
         if not m:
             continue
 
+        # Skip if WS hasn't confirmed price for this market (avoid stale/default data)
+        if ws and not ws.is_confirmed(pos["market_id"]):
+            continue
+
         price = m["yes_price"] if pos["side"] == "YES" else (1 - m["yes_price"])
+
         upnl = (price / pos["side_price"] - 1) * pos["stake_amt"]
         await db.update_position_price(pos["id"], price, upnl)
 
         pnl_pct = (price - pos["side_price"]) / pos["side_price"]
         close_reason = None
+
+        # Reject suspicious gap > 20% — likely stale/error price, not real
+        if pnl_pct < -0.20:
+            log.warning(f"[MONITOR] Suspicious gap: '{pos['question'][:35]}' entry:{pos['side_price']:.4f}→{price:.4f} ({pnl_pct*100:+.1f}%), skipping")
+            continue
 
         # Take profit
         if pnl_pct >= config["TP_PCT"]:
@@ -234,7 +245,13 @@ async def main():
             return
 
         price = new_price if pos["side"] == "YES" else (1 - new_price)
+
         pnl_pct = (price - pos["side_price"]) / pos["side_price"]
+
+        # Reject suspicious gap > 20% — likely stale/error, not a real move
+        if pnl_pct < -0.20:
+            log.warning(f"[WS-SL] Suspicious gap: '{pos['question'][:35]}' entry:{pos['side_price']:.4f}→{price:.4f} ({pnl_pct*100:+.1f}%), skipping auto-close")
+            return
 
         close_reason = None
         if pnl_pct >= CONFIG["TP_PCT"]:
@@ -274,7 +291,7 @@ async def main():
 
     ws.set_callbacks(on_price_change=on_price_change, on_trade=on_trade)
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     for sig_name in ("SIGTERM", "SIGINT"):
         try:
             import signal as _signal
@@ -311,7 +328,8 @@ async def main():
             try:
                 current_markets = list(market_map.values())
                 await monitor_positions(db, scanner, CONFIG, current_markets,
-                                        pos_cache=_open_positions, closing_ids=_closing_ids)
+                                        pos_cache=_open_positions, closing_ids=_closing_ids,
+                                        ws=ws)
             except Exception as e:
                 log.error(f"[MONITOR] {e}", exc_info=True)
             await asyncio.sleep(1)
@@ -419,8 +437,25 @@ async def main():
                 new_markets = await scanner.fetch()
                 if new_markets:
                     markets[:] = new_markets
-                    market_map.clear()
-                    market_map.update({m["id"]: m for m in markets})
+                    # Merge scanner data — preserve WS-confirmed prices for existing markets
+                    new_map = {m["id"]: m for m in markets}
+                    for mid, new_m in new_map.items():
+                        if mid in market_map:
+                            # Keep WS-confirmed price, only update metadata from scanner
+                            has_ws = ws.is_confirmed(mid)
+                            old_price = market_map[mid].get("yes_price")
+                            old_spread = market_map[mid].get("spread")
+                            market_map[mid].update(new_m)
+                            if has_ws and old_price is not None:
+                                market_map[mid]["yes_price"] = old_price
+                            if has_ws and old_spread is not None:
+                                market_map[mid]["spread"] = old_spread
+                        else:
+                            market_map[mid] = new_m
+                    # Remove markets no longer active
+                    stale = [mid for mid in market_map if mid not in new_map]
+                    for mid in stale:
+                        market_map.pop(mid, None)
                     groups = assign(markets)
                     new_grouped = []
                     for gm in groups.values():

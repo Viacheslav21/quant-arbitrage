@@ -120,7 +120,7 @@ class PolymarketWS:
         self._subscribed_tokens.update(new_tokens)
         msg = {
             "assets_ids": new_tokens,
-            "operation": "subscribe",
+            "type": "market",
             "custom_feature_enabled": True,
         }
         await self.ws.send(json.dumps(msg))
@@ -213,7 +213,9 @@ class PolymarketWS:
             self.prices[market_id]["ws_confirmed"] = True
 
         if self._on_trade and size > 0:
-            await self._on_trade(market_id, price, size, side)
+            is_yes = self.prices.get(market_id, {}).get("yes_token") == asset_id
+            trade_price = price if is_yes else round(1 - price, 4)
+            await self._on_trade(market_id, trade_price, size, side)
 
     def _handle_book(self, data: dict):
         """Handle book event — full orderbook snapshot."""
